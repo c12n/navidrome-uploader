@@ -1,0 +1,31 @@
+# Navidrome Uploader — ZimaOS Custom App compose.
+# Host paths are ABSOLUTE AppData paths (ZimaOS resolves relative paths
+# against its own empty app folder — learned deploying AlRashid Activity).
+# Deploy layout on the box:
+#   /media/ZimaOS-HD/AppData/navidrome-uploader/app/           <- app/main.py + requirements.txt
+#   /media/ZimaOS-HD/AppData/navidrome-uploader/data/          <- uploads.jsonl log
+#   /media/ZimaOS-HD/Media/Music/Music/                        <- Navidrome library (mounted at /music)
+# Replace __UPLOAD_TOKEN__, __NAVIDROME_USER__, __NAVIDROME_PASSWORD__
+# in the deploy copy (never commit the real values).
+services:
+  navidrome-uploader:
+    image: python:3.12-slim
+    container_name: navidrome-uploader
+    working_dir: /app
+    command: sh -c "apt-get update -qq && apt-get install -y -qq ffmpeg > /dev/null 2>&1; pip install --no-cache-dir -q -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port 8911"
+    ports:
+      - "8911:8911"
+    volumes:
+      - /media/ZimaOS-HD/AppData/navidrome-uploader/app:/app
+      - /media/ZimaOS-HD/AppData/navidrome-uploader/data:/data
+      - /media/ZimaOS-HD/Media/Music/Music:/music
+    environment:
+      UPLOAD_TOKEN: "__UPLOAD_TOKEN__"
+      LIBRARY_DIR: "/music"
+      DATA_DIR: "/data"
+      NAVIDROME_URL: "http://host.docker.internal:4533"
+      NAVIDROME_USER: "__NAVIDROME_USER__"
+      NAVIDROME_PASSWORD: "__NAVIDROME_PASSWORD__"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
