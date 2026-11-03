@@ -34,7 +34,7 @@ struct SettingsView: View {
                             .autocorrectionDisabled()
                             .multilineTextAlignment(.trailing)
                     }
-                    Text("The token is stored in the Keychain and sent as the X-Upload-Token header.")
+                    Text(tokenStateText)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -65,13 +65,31 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Version", value: "1.0.0 (1)")
+                    LabeledContent("Version", value: Self.versionString)
                 } footer: {
                     Text("NaviUpload \u{2014} upload music to your Navidrome library from files or URLs.")
                 }
             }
             .navigationTitle("Settings")
         }
+    }
+
+    /// What the Token field currently holds, without revealing it:
+    /// enough for the user to sanity-check a paste (length + charset
+    /// hint for the server's token format).
+    private var tokenStateText: String {
+        let token = settings.token.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.isEmpty {
+            return "No token saved yet \u{2014} uploads will fail until you paste the server\u{2019}s UPLOAD_TOKEN here (32 characters, letters a\u{2013}f and digits, no dashes)."
+        }
+        return "Token saved (\(token.count) characters), stored in the Keychain and sent as the X-Upload-Token header. It must match the server\u{2019}s UPLOAD_TOKEN exactly."
+    }
+
+    private static var versionString: String {
+        let info = Bundle.main.infoDictionary
+        let v = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(v) (\(b))"
     }
 
     private func testConnection() {
@@ -81,8 +99,23 @@ struct SettingsView: View {
         Task {
             do {
                 let health = try await client.health()
-                testSucceeded = health.status == "ok"
-                testResult = "Connected \u{2014} status \u{201C}\(health.status)\u{201D}, \(health.libraryFiles) files in the library."
+                guard health.status == "ok" else {
+                    testSucceeded = false
+                    testResult = "Server answered with status \u{201C}\(health.status)\u{201D}."
+                    isTesting = false
+                    return
+                }
+                // /health is public: it proves reachability only. Probe
+                // an authenticated endpoint so a missing/wrong token is
+                // caught here instead of at the first upload.
+                do {
+                    try await client.verifyToken()
+                    testSucceeded = true
+                    testResult = "Connected \u{2014} token accepted, \(health.libraryFiles) files in the library."
+                } catch let APIError.http(status, _) where status == 401 {
+                    testSucceeded = false
+                    testResult = "Server is reachable, but the token was rejected. Paste the server\u{2019}s UPLOAD_TOKEN into the Token field above."
+                }
             } catch {
                 testSucceeded = false
                 testResult = (error as? LocalizedError)?.errorDescription

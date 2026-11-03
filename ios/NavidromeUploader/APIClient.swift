@@ -74,7 +74,11 @@ struct APIClient {
     private func decode<T: Decodable>(_ type: T.Type, data: Data, response: URLResponse) throws -> T {
         guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {
-            throw APIError.http(status: http.statusCode, message: APIError.message(from: data))
+            var message = APIError.message(from: data)
+            if http.statusCode == 401 {
+                message += " Check that the token in Settings matches the server\u{2019}s UPLOAD_TOKEN exactly."
+            }
+            throw APIError.http(status: http.statusCode, message: message)
         }
         do {
             return try JSONDecoder().decode(type, from: data)
@@ -91,6 +95,23 @@ struct APIClient {
         req.httpMethod = "GET"
         let (data, response) = try await URLSession.shared.data(for: req)
         return try decode(HealthResponse.self, data: data, response: response)
+    }
+
+    // MARK: Token check
+
+    private struct RecentProbe: Decodable {
+        struct Item: Decodable {}
+        let uploads: [Item]?
+    }
+
+    /// GET /health needs no token, so it cannot prove the token is
+    /// right. This probes GET /recent (authenticated): it throws the
+    /// server's 401 when the saved token is missing or wrong.
+    func verifyToken() async throws {
+        var req = try request(for: "recent")
+        req.httpMethod = "GET"
+        let (data, response) = try await URLSession.shared.data(for: req)
+        _ = try decode(RecentProbe.self, data: data, response: response)
     }
 
     // MARK: URL upload

@@ -105,9 +105,12 @@ final class SettingsStore {
         return URL(string: trimmed)
     }
 
-    /// A client configured with the current settings.
+    /// A client configured with the current settings. The token is
+    /// trimmed — a token pasted from a terminal easily picks up a
+    /// stray space or newline, which the server rightly rejects.
     var client: APIClient {
-        APIClient(baseURLString: baseURLString, token: token)
+        APIClient(baseURLString: baseURLString,
+                  token: token.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
 

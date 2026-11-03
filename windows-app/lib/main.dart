@@ -176,6 +176,10 @@ class AppState extends ChangeNotifier {
   HealthResult? lastHealth;
   String? healthError;
   DateTime? lastHealthAt;
+  // Verdict of the authenticated probe that follows a successful
+  // /health (which itself needs no token): "accepted" / "rejected" /
+  // "missing". Null when no verdict yet.
+  String? tokenCheck;
 
   Future<void> boot() async {
     final prefs = await SharedPreferences.getInstance();
@@ -271,10 +275,23 @@ class AppState extends ChangeNotifier {
       lastHealth = h;
       healthError = null;
       lastHealthAt = DateTime.now();
+      // /health is public — also probe an authenticated endpoint so a
+      // wrong token is caught here, not at the first upload.
+      final t = token;
+      if (t == null || t.isEmpty) {
+        tokenCheck = 'missing';
+      } else {
+        try {
+          tokenCheck = await api.recentStatus() == 200 ? 'accepted' : 'rejected';
+        } catch (_) {
+          tokenCheck = null;
+        }
+      }
     } catch (e) {
       lastHealth = null;
       healthError = e.toString();
       lastHealthAt = DateTime.now();
+      tokenCheck = null;
     } finally {
       checkingHealth = false;
       notifyListeners();
@@ -341,6 +358,15 @@ class NaviApi {
       // Fall through to the generic-but-honest error below.
     }
     throw const ApiException('The server answered with an unreadable reply.');
+  }
+
+  /// Status code of an authenticated GET /recent — 200 means the
+  /// saved token is the server's token, 401 means it is not.
+  Future<int> recentStatus() async {
+    final r = await http
+        .get(_uri('/recent'), headers: _authHeaders)
+        .timeout(const Duration(seconds: 15));
+    return r.statusCode;
   }
 
   Future<HealthResult> health() async {
@@ -1384,6 +1410,12 @@ class _SettingsPageState extends State<SettingsPage> {
                   ? 'Instant scan is set up on the server'
                   : 'Instant scan not configured — Navidrome picks '
                       'uploads up on its own scan',
+              if (appState.tokenCheck == 'accepted')
+                'Token accepted'
+              else if (appState.tokenCheck == 'rejected')
+                'Token REJECTED — re-paste the server UPLOAD_TOKEN above'
+              else if (appState.tokenCheck == 'missing')
+                'No token saved yet',
             ].join(' · '),
             style: theme.textTheme.bodyMedium,
           ),
