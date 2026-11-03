@@ -67,7 +67,7 @@ struct SettingsView: View {
                 Section {
                     LabeledContent("Version", value: "1.0.0 (1)")
                 } footer: {
-                    Text("Navidrome Uploader \u{2014} upload music to your Navidrome library from files or URLs.")
+                    Text("NaviUpload \u{2014} upload music to your Navidrome library from files or URLs.")
                 }
             }
             .navigationTitle("Settings")

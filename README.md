@@ -1,4 +1,4 @@
-# Navidrome Uploader
+# NaviUpload (Navidrome Uploader)
 
 Copyright (c) 2026 c12n Apps
 
