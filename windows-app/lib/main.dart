@@ -101,11 +101,66 @@ class UploadResult {
   final String savedAs;
   final int size;
   final bool scanTriggered;
+  final String? via;
+  final int alsoSaved;
+  final String folder;
+  final bool enriched;
+  final String? metadataSource;
+  final bool lyricsEmbedded;
+  final String? matchedTitle;
+  final List<UploadResult> files;
+
   const UploadResult({
     required this.savedAs,
     required this.size,
     required this.scanTriggered,
+    this.via,
+    this.alsoSaved = 0,
+    this.folder = '',
+    this.enriched = false,
+    this.metadataSource,
+    this.lyricsEmbedded = false,
+    this.matchedTitle,
+    this.files = const [],
   });
+
+  factory UploadResult.fromJson(Map<String, dynamic> j) {
+    final rawFiles = j['files'];
+    return UploadResult(
+      savedAs: (j['saved_as'] ?? j['savedAs'] ?? '').toString(),
+      size: (j['size'] as num?)?.toInt() ?? 0,
+      scanTriggered:
+          j['scan_triggered'] == true || j['scanTriggered'] == true,
+      via: j['via'] as String?,
+      alsoSaved: (j['also_saved'] as num?)?.toInt() ?? 0,
+      folder: (j['folder'] as String?) ?? '',
+      enriched: j['enriched'] == true,
+      metadataSource: j['metadata_source'] as String?,
+      lyricsEmbedded: j['lyrics_embedded'] == true,
+      matchedTitle: j['matched_title'] as String?,
+      files: rawFiles is List
+          ? rawFiles
+              .whereType<Map<String, dynamic>>()
+              .map(UploadResult.fromJson)
+              .toList()
+          : const [],
+    );
+  }
+
+  /// One short line per thing the server did to the file while
+  /// saving it — shown under queue rows and URL results.
+  List<String> get processingNotes {
+    final notes = <String>[];
+    if (enriched && matchedTitle != null) {
+      notes.add('Tagged as "$matchedTitle"');
+    } else if (enriched) {
+      notes.add('Metadata cleaned up');
+    }
+    if (lyricsEmbedded) notes.add('Lyrics embedded');
+    if (folder.isNotEmpty) notes.add('Filed under $folder');
+    if (via != null) notes.add('via $via');
+    return notes;
+  }
 }
 
 class HistoryItem {
@@ -115,6 +170,11 @@ class HistoryItem {
   final int size;
   final bool scanTriggered;
   final String savedAs;
+  // Library sub-folder the server filed the song under ('' = root).
+  final String folder;
+  // True for entries merged in from the server's /recent list rather
+  // than recorded by this app.
+  final bool fromServer;
 
   const HistoryItem({
     required this.name,
@@ -123,6 +183,8 @@ class HistoryItem {
     required this.size,
     required this.scanTriggered,
     required this.savedAs,
+    this.folder = '',
+    this.fromServer = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -132,6 +194,7 @@ class HistoryItem {
         'size': size,
         'scanTriggered': scanTriggered,
         'savedAs': savedAs,
+        'folder': folder,
       };
 
   factory HistoryItem.fromJson(Map<String, dynamic> j) => HistoryItem(
@@ -141,7 +204,49 @@ class HistoryItem {
         size: (j['size'] as num?)?.toInt() ?? 0,
         scanTriggered: j['scanTriggered'] as bool? ?? false,
         savedAs: j['savedAs'] as String? ?? (j['name'] as String? ?? ''),
+        folder: j['folder'] as String? ?? '',
       );
+}
+
+class LibraryStats {
+  final int libraryFiles;
+  final int uploadedTotal;
+  final int uploadedBytes;
+  final DateTime? lastUploadAt;
+  const LibraryStats({
+    required this.libraryFiles,
+    required this.uploadedTotal,
+    required this.uploadedBytes,
+    this.lastUploadAt,
+  });
+}
+
+class ScanResult {
+  final bool configured;
+  final bool triggered;
+  const ScanResult({required this.configured, required this.triggered});
+}
+
+class DuplicateCheck {
+  final String name;
+  final bool exists;
+  final bool sameSize;
+  const DuplicateCheck({
+    required this.name,
+    required this.exists,
+    required this.sameSize,
+  });
+}
+
+class LibraryMatch {
+  final bool configured;
+  final bool found;
+  final String? matchedTitle;
+  const LibraryMatch({
+    required this.configured,
+    required this.found,
+    this.matchedTitle,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +271,15 @@ class AppState extends ChangeNotifier {
 
   int accentIndex = 0;
   int appearanceMode = 2; // 0 system, 1 light, 2 dark (default dark)
+
+  // Server-side processing preferences (Settings → Processing),
+  // sent with every upload. File uploads stay untagged by default —
+  // albums usually arrive already tagged.
+  bool enrichURLs = true;
+  bool enrichFiles = false;
+  bool embedLyrics = true;
+  bool sortFolders = false;
+  bool skipDuplicates = true;
 
   Accent get accent => kAccents[accentIndex.clamp(0, kAccents.length - 1)];
 
@@ -194,6 +308,11 @@ class AppState extends ChangeNotifier {
         prefs.getString('naviupload_server_url') ?? serverUrl;
     accentIndex = prefs.getInt('naviupload_accent') ?? 0;
     appearanceMode = prefs.getInt('naviupload_appearance') ?? 2;
+    enrichURLs = prefs.getBool('processing.enrichURLs') ?? true;
+    enrichFiles = prefs.getBool('processing.enrichFiles') ?? false;
+    embedLyrics = prefs.getBool('processing.embedLyrics') ?? true;
+    sortFolders = prefs.getBool('processing.sortFolders') ?? false;
+    skipDuplicates = prefs.getBool('processing.skipDuplicates') ?? true;
     token = await _secure.read(key: 'upload_token');
     torboxKey = await _secure.read(key: 'torbox_api_key');
     premiumizeKey = await _secure.read(key: 'premiumize_api_key');
@@ -272,6 +391,36 @@ class AppState extends ChangeNotifier {
     appearanceMode = mode;
     notifyListeners();
     await _prefs?.setInt('naviupload_appearance', mode);
+  }
+
+  Future<void> setEnrichURLs(bool v) async {
+    enrichURLs = v;
+    notifyListeners();
+    await _prefs?.setBool('processing.enrichURLs', v);
+  }
+
+  Future<void> setEnrichFiles(bool v) async {
+    enrichFiles = v;
+    notifyListeners();
+    await _prefs?.setBool('processing.enrichFiles', v);
+  }
+
+  Future<void> setEmbedLyrics(bool v) async {
+    embedLyrics = v;
+    notifyListeners();
+    await _prefs?.setBool('processing.embedLyrics', v);
+  }
+
+  Future<void> setSortFolders(bool v) async {
+    sortFolders = v;
+    notifyListeners();
+    await _prefs?.setBool('processing.sortFolders', v);
+  }
+
+  Future<void> setSkipDuplicates(bool v) async {
+    skipDuplicates = v;
+    notifyListeners();
+    await _prefs?.setBool('processing.skipDuplicates', v);
   }
 
   Future<void> _saveHistory() async {
@@ -386,14 +535,8 @@ class NaviApi {
     }
     try {
       final decoded = jsonDecode(r.body);
-      if (decoded is Map) {
-        return UploadResult(
-          savedAs: (decoded['saved_as'] ?? decoded['savedAs'] ?? '')
-              .toString(),
-          size: (decoded['size'] as num?)?.toInt() ?? 0,
-          scanTriggered: decoded['scan_triggered'] == true ||
-              decoded['scanTriggered'] == true,
-        );
+      if (decoded is Map<String, dynamic>) {
+        return UploadResult.fromJson(decoded);
       }
     } catch (_) {
       // Fall through to the generic-but-honest error below.
@@ -449,6 +592,9 @@ class NaviApi {
   Future<UploadResult> uploadFile(
     File file,
     String displayName, {
+    bool enrich = false,
+    bool lyrics = false,
+    bool sort = false,
     required void Function(double progress) onProgress,
   }) async {
     final fileLength = await file.length();
@@ -459,9 +605,20 @@ class NaviApi {
         .replaceAll('\r', ' ')
         .replaceAll('\n', ' ');
     if (safeName.isEmpty) safeName = 'upload';
-    final header = utf8.encode('--$boundary\r\n'
-        'Content-Disposition: form-data; name="file"; filename="$safeName"\r\n'
-        'Content-Type: application/octet-stream\r\n\r\n');
+    // The processing flags ride along as plain form fields ahead of
+    // the file part, in the same hand-assembled multipart body.
+    String formField(String name, bool value) => '--$boundary\r\n'
+        'Content-Disposition: form-data; name="$name"\r\n\r\n'
+        '${value ? 'true' : 'false'}\r\n';
+    final headerBuffer = StringBuffer()
+      ..write(formField('enrich', enrich))
+      ..write(formField('lyrics', lyrics))
+      ..write(formField('sort', sort))
+      ..write('--$boundary\r\n')
+      ..write('Content-Disposition: form-data; name="file"; '
+          'filename="$safeName"\r\n')
+      ..write('Content-Type: application/octet-stream\r\n\r\n');
+    final header = utf8.encode(headerBuffer.toString());
     final footer = utf8.encode('\r\n--$boundary--\r\n');
     final total = header.length + fileLength + footer.length;
 
@@ -505,7 +662,12 @@ class NaviApi {
     return _parseUpload(r);
   }
 
-  Future<UploadResult> uploadUrl(String url) async {
+  Future<UploadResult> uploadUrl(
+    String url, {
+    bool enrich = false,
+    bool lyrics = false,
+    bool sort = false,
+  }) async {
     final http.Response r;
     try {
       r = await http.post(
@@ -515,12 +677,192 @@ class NaviApi {
           ..._authHeaders,
           ..._debridHeaders,
         },
-        body: jsonEncode({'url': url}),
+        body: jsonEncode({
+          'url': url,
+          'enrich': enrich,
+          'lyrics': lyrics,
+          'sort': sort,
+        }),
       );
     } catch (e) {
       throw ApiException('Could not reach the server: $e');
     }
     return _parseUpload(r);
+  }
+
+  /// Ask Navidrome (through the server) to rescan the library now.
+  Future<ScanResult> scanLibrary() async {
+    final http.Response r;
+    try {
+      r = await http
+          .post(_uri('/scan'), headers: _authHeaders)
+          .timeout(const Duration(seconds: 30));
+    } catch (e) {
+      throw ApiException('Could not reach the server: $e');
+    }
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    try {
+      final decoded = jsonDecode(r.body);
+      if (decoded is Map) {
+        return ScanResult(
+          configured: decoded['scan_configured'] == true,
+          triggered: decoded['scan_triggered'] == true,
+        );
+      }
+    } catch (_) {
+      // Fall through.
+    }
+    throw const ApiException('The server answered with an unreadable reply.');
+  }
+
+  /// Library + upload counters for the Upload page stats card.
+  Future<LibraryStats> fetchStats() async {
+    final http.Response r;
+    try {
+      r = await http
+          .get(_uri('/stats'), headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
+    } catch (e) {
+      throw ApiException('Could not reach the server: $e');
+    }
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    try {
+      final decoded = jsonDecode(r.body);
+      if (decoded is Map) {
+        final rawAt = (decoded['last_upload_at'] as num?)?.toInt();
+        return LibraryStats(
+          libraryFiles: (decoded['library_files'] as num?)?.toInt() ?? 0,
+          uploadedTotal: (decoded['uploaded_total'] as num?)?.toInt() ?? 0,
+          uploadedBytes: (decoded['uploaded_bytes'] as num?)?.toInt() ?? 0,
+          // The contract says epoch; accept seconds, tolerate ms.
+          lastUploadAt: rawAt == null || rawAt <= 0
+              ? null
+              : DateTime.fromMillisecondsSinceEpoch(
+                  rawAt > 100000000000 ? rawAt : rawAt * 1000),
+        );
+      }
+    } catch (_) {
+      // Fall through.
+    }
+    throw const ApiException('The server answered with an unreadable reply.');
+  }
+
+  /// Ask the server which of these files the library already has.
+  /// Results come back in request order.
+  Future<List<DuplicateCheck>> checkDuplicates(
+      List<({String name, int size})> items) async {
+    final http.Response r;
+    try {
+      r = await http
+          .post(
+            _uri('/check'),
+            headers: {'Content-Type': 'application/json', ..._authHeaders},
+            body: jsonEncode({
+              'items': [
+                for (final i in items) {'name': i.name, 'size': i.size},
+              ],
+            }),
+          )
+          .timeout(const Duration(seconds: 30));
+    } catch (e) {
+      throw ApiException('Could not reach the server: $e');
+    }
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    try {
+      final decoded = jsonDecode(r.body);
+      if (decoded is Map && decoded['results'] is List) {
+        return [
+          for (final e in decoded['results'] as List)
+            if (e is Map)
+              DuplicateCheck(
+                name: (e['name'] ?? '').toString(),
+                exists: e['exists'] == true,
+                sameSize: e['same_size'] == true,
+              ),
+        ];
+      }
+    } catch (_) {
+      // Fall through.
+    }
+    throw const ApiException('The server answered with an unreadable reply.');
+  }
+
+  /// Has Navidrome indexed this song yet? Used after a scan-triggered
+  /// download to confirm the track is actually in the library.
+  Future<LibraryMatch> inLibrary(String title, String artist) async {
+    final uri = _uri('/in-library').replace(queryParameters: {
+      'title': title,
+      'artist': artist,
+    });
+    final http.Response r;
+    try {
+      r = await http
+          .get(uri, headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
+    } catch (e) {
+      throw ApiException('Could not reach the server: $e');
+    }
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    try {
+      final decoded = jsonDecode(r.body);
+      if (decoded is Map) {
+        return LibraryMatch(
+          configured: decoded['configured'] == true,
+          found: decoded['found'] == true,
+          matchedTitle: decoded['matched_title'] as String?,
+        );
+      }
+    } catch (_) {
+      // Fall through.
+    }
+    throw const ApiException('The server answered with an unreadable reply.');
+  }
+
+  /// The server's own upload log (newest first), as history entries
+  /// flagged fromServer so the History page can chip them.
+  Future<List<HistoryItem>> fetchRecent() async {
+    final http.Response r;
+    try {
+      r = await http
+          .get(_uri('/recent'), headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
+    } catch (e) {
+      throw ApiException('Could not reach the server: $e');
+    }
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    try {
+      final decoded = jsonDecode(r.body);
+      if (decoded is Map && decoded['uploads'] is List) {
+        return [
+          for (final e in decoded['uploads'] as List)
+            if (e is Map)
+              HistoryItem(
+                name: (e['saved_as'] ?? '').toString(),
+                source: e['source'] == 'url' ? 'URL' : 'File',
+                at: DateTime.fromMillisecondsSinceEpoch(
+                    ((e['at'] as num?)?.toInt() ?? 0) * 1000),
+                size: (e['size'] as num?)?.toInt() ?? 0,
+                scanTriggered: e['scan_triggered'] == true,
+                savedAs: (e['saved_as'] ?? '').toString(),
+                folder: (e['folder'] as String?) ?? '',
+                fromServer: true,
+              ),
+        ];
+      }
+    } catch (_) {
+      // Fall through.
+    }
+    throw const ApiException('The server answered with an unreadable reply.');
   }
 }
 
@@ -811,7 +1153,7 @@ class _SectionHeader extends StatelessWidget {
 // Upload page: drag-and-drop zone, file picker, sequential upload queue
 // ---------------------------------------------------------------------------
 
-enum QueueStatus { queued, uploading, done, error }
+enum QueueStatus { queued, uploading, done, error, skipped }
 
 class QueueItem {
   final String name;
@@ -822,8 +1164,28 @@ class QueueItem {
   String? savedAs;
   bool scanTriggered = false;
   String? message;
+  // Full server reply for the done row's processing notes.
+  UploadResult? result;
+  // Failed upload attempts so far (one automatic retry is allowed).
+  int attempts = 0;
+  // The library holds a different file with this exact byte size.
+  bool sizeNote = false;
 
   QueueItem({required this.name, required this.path, required this.size});
+}
+
+enum UrlStatus { waiting, busy, done, error }
+
+class UrlItem {
+  final String url;
+  UrlStatus status = UrlStatus.waiting;
+  UploadResult? result;
+  String? message;
+  // Set a few seconds after a scan-triggered save, once the server
+  // has checked whether Navidrome has indexed the track.
+  String? libraryNote;
+
+  UrlItem(this.url);
 }
 
 class UploadPage extends StatefulWidget {
@@ -837,6 +1199,90 @@ class _UploadPageState extends State<UploadPage> {
   final List<QueueItem> _queue = [];
   bool _dragging = false;
   bool _processing = false;
+  bool _paused = false;
+
+  // Library stats card state.
+  LibraryStats? _stats;
+  String? _statsError;
+  bool _scanBusy = false;
+  String? _scanOutcome;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadStatsWhenReady());
+  }
+
+  Future<void> _loadStatsWhenReady() async {
+    // The page is built before AppState.boot() lands; wait for the
+    // saved server/token before asking the server for numbers.
+    while (!appState.booted) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      if (!mounted) return;
+    }
+    await _loadStats();
+  }
+
+  Future<void> _loadStats() async {
+    try {
+      final s = await appState.api.fetchStats();
+      if (!mounted) return;
+      setState(() {
+        _stats = s;
+        _statsError = null;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _statsError =
+            'Could not load library stats — check the server in Settings.';
+      });
+    }
+  }
+
+  Future<void> _refreshLibrary() async {
+    if (_scanBusy) return;
+    setState(() {
+      _scanBusy = true;
+      _scanOutcome = null;
+    });
+    try {
+      final res = await appState.api.scanLibrary();
+      if (!mounted) return;
+      final String outcome;
+      if (res.triggered) {
+        outcome =
+            'Refresh triggered — new songs appear in Navidrome within seconds.';
+      } else if (res.configured) {
+        outcome =
+            'Navidrome did not accept the refresh this time. Try again in a moment.';
+      } else {
+        outcome = 'Instant refresh is not set up on the server yet '
+            '(it needs the Navidrome login in the server config). '
+            'Uploads still appear after Navidrome\'s own scheduled scan.';
+      }
+      setState(() {
+        _scanOutcome = outcome;
+        _scanBusy = false;
+      });
+      if (res.triggered) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        if (mounted) await _loadStats();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _scanOutcome = e.toString();
+        _scanBusy = false;
+      });
+    }
+  }
+
+  int get _waitingCount =>
+      _queue.where((q) => q.status == QueueStatus.queued).length;
+
+  int get _failedCount =>
+      _queue.where((q) => q.status == QueueStatus.error).length;
 
   void _snack(String text) {
     ScaffoldMessenger.of(context)
@@ -870,7 +1316,6 @@ class _UploadPageState extends State<UploadPage> {
         _enqueue(f.name, path, size);
       }
     });
-    unawaited(_processQueue());
   }
 
   void _addDropped(List<dynamic> files) {
@@ -899,66 +1344,141 @@ class _UploadPageState extends State<UploadPage> {
           ? 'Skipped 1 non-audio file.'
           : 'Skipped $skipped non-audio files.');
     }
-    unawaited(_processQueue());
   }
 
-  Future<void> _processQueue() async {
+  /// Start (or restart) the queue run: duplicate-check everything
+  /// waiting, upload sequentially, then give each failure one
+  /// automatic second chance.
+  Future<void> _runQueue() async {
     if (_processing) return;
     _processing = true;
+    _paused = false;
+    if (mounted) setState(() {});
     try {
-      while (true) {
-        QueueItem? next;
-        for (final q in _queue) {
-          if (q.status == QueueStatus.queued) {
-            next = q;
-            break;
-          }
-        }
-        if (next == null) break;
-        final item = next;
-        if (mounted) {
-          setState(() {
-            item.status = QueueStatus.uploading;
-            item.progress = 0;
-          });
-        }
-        try {
-          final res = await appState.api.uploadFile(
-            File(item.path),
-            item.name,
-            onProgress: (p) {
-              if (mounted) {
-                setState(() => item.progress = p);
-              }
-            },
-          );
-          if (mounted) {
-            setState(() {
-              item.status = QueueStatus.done;
-              item.progress = 1;
-              item.savedAs = res.savedAs;
-              item.scanTriggered = res.scanTriggered;
-            });
-          }
-          appState.addHistory(HistoryItem(
-            name: res.savedAs.isNotEmpty ? res.savedAs : item.name,
-            source: 'File',
-            at: DateTime.now(),
-            size: res.size > 0 ? res.size : item.size,
-            scanTriggered: res.scanTriggered,
-            savedAs: res.savedAs,
-          ));
-        } catch (e) {
-          if (mounted) {
-            setState(() {
-              item.status = QueueStatus.error;
-              item.message = e.toString();
-            });
+      if (appState.skipDuplicates) {
+        final waiting =
+            _queue.where((q) => q.status == QueueStatus.queued).toList();
+        if (waiting.isNotEmpty) {
+          try {
+            final checks = await appState.api.checkDuplicates([
+              for (final q in waiting) (name: q.name, size: q.size),
+            ]);
+            if (mounted) {
+              setState(() {
+                for (var i = 0; i < waiting.length && i < checks.length; i++) {
+                  if (checks[i].exists) {
+                    waiting[i].status = QueueStatus.skipped;
+                  } else if (checks[i].sameSize) {
+                    waiting[i].sizeNote = true;
+                  }
+                }
+              });
+            }
+          } catch (_) {
+            // A failed duplicate check must never block uploads.
           }
         }
       }
+      await _drainQueue();
+      final failed = _queue
+          .where((q) => q.status == QueueStatus.error && q.attempts <= 1)
+          .toList();
+      if (failed.isNotEmpty) {
+        if (mounted) {
+          setState(() {
+            for (final q in failed) {
+              q.status = QueueStatus.queued;
+              q.message = null;
+            }
+          });
+        }
+        await _drainQueue();
+      }
     } finally {
       _processing = false;
+      _paused = false;
+      if (mounted) setState(() {});
+      unawaited(_loadStats());
+    }
+  }
+
+  /// Manual retry: failed items get a fresh attempt budget.
+  void _retryFailed() {
+    if (_processing) return;
+    setState(() {
+      for (final q in _queue) {
+        if (q.status == QueueStatus.error) {
+          q.attempts = 0;
+          q.status = QueueStatus.queued;
+          q.message = null;
+        }
+      }
+    });
+    unawaited(_runQueue());
+  }
+
+  /// Upload every queued item, one at a time, honouring pause.
+  Future<void> _drainQueue() async {
+    while (true) {
+      while (_paused) {
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+        if (!mounted) return;
+      }
+      QueueItem? next;
+      for (final q in _queue) {
+        if (q.status == QueueStatus.queued) {
+          next = q;
+          break;
+        }
+      }
+      if (next == null) break;
+      final item = next;
+      if (mounted) {
+        setState(() {
+          item.status = QueueStatus.uploading;
+          item.progress = 0;
+        });
+      }
+      try {
+        final res = await appState.api.uploadFile(
+          File(item.path),
+          item.name,
+          enrich: appState.enrichFiles,
+          lyrics: appState.embedLyrics,
+          sort: appState.sortFolders,
+          onProgress: (p) {
+            if (mounted) {
+              setState(() => item.progress = p);
+            }
+          },
+        );
+        if (mounted) {
+          setState(() {
+            item.status = QueueStatus.done;
+            item.progress = 1;
+            item.savedAs = res.savedAs;
+            item.scanTriggered = res.scanTriggered;
+            item.result = res;
+          });
+        }
+        appState.addHistory(HistoryItem(
+          name: res.savedAs.isNotEmpty ? res.savedAs : item.name,
+          source: 'File',
+          at: DateTime.now(),
+          size: res.size > 0 ? res.size : item.size,
+          scanTriggered: res.scanTriggered,
+          savedAs: res.savedAs,
+          folder: res.folder,
+        ));
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            item.status = QueueStatus.error;
+            item.attempts++;
+            item.message = e.toString();
+          });
+        }
+      }
     }
   }
 
@@ -970,7 +1490,13 @@ class _UploadPageState extends State<UploadPage> {
     switch (item.status) {
       case QueueStatus.queued:
         trailing = const Icon(Icons.schedule);
-        bottom = Text('Queued', style: theme.textTheme.bodyMedium);
+        bottom = Text(
+          item.sizeNote
+              ? 'A file with this size is already in the library — '
+                  'will upload anyway'
+              : 'Waiting',
+          style: theme.textTheme.bodyMedium,
+        );
       case QueueStatus.uploading:
         trailing = Text('${(item.progress * 100).round()}%',
             style: theme.textTheme.titleMedium);
@@ -978,9 +1504,12 @@ class _UploadPageState extends State<UploadPage> {
       case QueueStatus.done:
         trailing = Icon(Icons.check_circle, color: Colors.green, size: 30);
         bottom = Text(
-          item.scanTriggered
-              ? 'Saved as ${item.savedAs} · library scan started'
-              : 'Saved as ${item.savedAs}',
+          [
+            item.scanTriggered
+                ? 'Saved as ${item.savedAs} · library scan started'
+                : 'Saved as ${item.savedAs}',
+            ...?item.result?.processingNotes,
+          ].join(' · '),
           style: theme.textTheme.bodyMedium,
         );
       case QueueStatus.error:
@@ -989,6 +1518,14 @@ class _UploadPageState extends State<UploadPage> {
           item.message ?? 'Upload failed',
           style:
               theme.textTheme.bodyMedium?.copyWith(color: scheme.error),
+        );
+      case QueueStatus.skipped:
+        trailing =
+            Icon(Icons.library_music, color: scheme.onSurfaceVariant, size: 30);
+        bottom = Text(
+          'Already in your library — skipped',
+          style: theme.textTheme.bodyMedium
+              ?.copyWith(color: scheme.onSurfaceVariant),
         );
     }
     return Card(
@@ -1022,6 +1559,122 @@ class _UploadPageState extends State<UploadPage> {
     );
   }
 
+  Widget _statsCard(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    Widget stat(String value, String label) {
+      return Expanded(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(value, style: theme.textTheme.headlineSmall),
+            Text(
+              label,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Your library', style: theme.textTheme.titleLarge),
+            const SizedBox(height: 14),
+            if (_statsError != null)
+              Text(
+                _statsError!,
+                style: theme.textTheme.bodyMedium
+                    ?.copyWith(color: scheme.error),
+              )
+            else if (_stats == null)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: LinearProgressIndicator(),
+              )
+            else
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  stat(thousands(_stats!.libraryFiles),
+                      'Songs in the library'),
+                  stat(thousands(_stats!.uploadedTotal),
+                      'Uploaded via NaviUpload'),
+                  if (_stats!.uploadedBytes > 0)
+                    stat(formatBytes(_stats!.uploadedBytes), 'Added'),
+                ],
+              ),
+            const SizedBox(height: 16),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: FilledButton.tonalIcon(
+                onPressed: _scanBusy ? null : _refreshLibrary,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Refresh library'),
+              ),
+            ),
+            if (_scanBusy) ...[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(),
+            ],
+            if (_scanOutcome != null) ...[
+              const SizedBox(height: 12),
+              Text(_scanOutcome!, style: theme.textTheme.bodyMedium),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _queueControls(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Wrap(
+        spacing: 12,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          FilledButton.icon(
+            onPressed: (_processing || _waitingCount == 0)
+                ? null
+                : () => unawaited(_runQueue()),
+            icon: const Icon(Icons.cloud_upload),
+            label: Text(_waitingCount == 1
+                ? 'Upload 1 file'
+                : 'Upload $_waitingCount files'),
+          ),
+          if (_processing)
+            FilledButton.tonalIcon(
+              onPressed: () => setState(() => _paused = !_paused),
+              icon: Icon(_paused ? Icons.play_arrow : Icons.pause),
+              label: Text(_paused ? 'Resume' : 'Pause'),
+            ),
+          if (!_processing && _failedCount > 0)
+            FilledButton.tonalIcon(
+              onPressed: _retryFailed,
+              icon: const Icon(Icons.replay),
+              label: Text(_failedCount == 1
+                  ? 'Retry 1 failed'
+                  : 'Retry $_failedCount failed'),
+            ),
+          TextButton(
+            onPressed: () => setState(() {
+              _queue.removeWhere(
+                  (q) => q.status != QueueStatus.uploading);
+            }),
+            child: const Text('Clear list'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -1030,6 +1683,8 @@ class _UploadPageState extends State<UploadPage> {
       padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
       children: [
         const _SectionHeader('Upload files'),
+        _statsCard(context),
+        const SizedBox(height: 8),
         DropTarget(
           onDragEntered: (_) => setState(() => _dragging = true),
           onDragExited: (_) => setState(() => _dragging = false),
@@ -1080,26 +1735,14 @@ class _UploadPageState extends State<UploadPage> {
         ),
         if (_queue.isNotEmpty) ...[
           const _SectionHeader('Queue'),
+          _queueControls(context),
           for (final item in _queue) _queueRow(context, item),
-          const SizedBox(height: 8),
-          Align(
-            alignment: Alignment.centerRight,
-            child: TextButton(
-              onPressed: _processing
-                  ? null
-                  : () => setState(() {
-                        _queue.removeWhere(
-                            (q) => q.status != QueueStatus.uploading);
-                      }),
-              child: const Text('Clear finished'),
-            ),
-          ),
         ] else ...[
           const SizedBox(height: 28),
           Center(
             child: Text(
-              'Files you add upload one at a time, straight into the '
-              'Navidrome library folder.',
+              'Add files, then press Upload — they go one at a time, '
+              'straight into the Navidrome library folder.',
               style: theme.textTheme.bodyLarge
                   ?.copyWith(color: scheme.onSurfaceVariant),
               textAlign: TextAlign.center,
@@ -1124,14 +1767,37 @@ class UrlPage extends StatefulWidget {
 
 class _UrlPageState extends State<UrlPage> {
   final TextEditingController _urlCtrl = TextEditingController();
+  final List<UrlItem> _items = [];
   bool _busy = false;
-  UploadResult? _result;
-  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    // The download button label counts the links as they are typed.
+    _urlCtrl.addListener(() {
+      if (mounted) setState(() {});
+    });
+  }
 
   @override
   void dispose() {
     _urlCtrl.dispose();
     super.dispose();
+  }
+
+  /// Split pasted text into links: whitespace-separated http(s)
+  /// tokens, deduped, order preserved.
+  static List<String> parseLinks(String text) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final token in text.split(RegExp(r'\s+'))) {
+      final t = token.trim();
+      if ((t.startsWith('http://') || t.startsWith('https://')) &&
+          seen.add(t)) {
+        out.add(t);
+      }
+    }
+    return out;
   }
 
   Future<void> _paste() async {
@@ -1140,47 +1806,184 @@ class _UrlPageState extends State<UrlPage> {
     if (text == null || text.isEmpty) return;
     setState(() {
       _urlCtrl.text = text;
-      _result = null;
-      _error = null;
     });
   }
 
   Future<void> _submit() async {
-    final url = _urlCtrl.text.trim();
-    if (url.isEmpty || _busy) return;
+    if (_busy) return;
+    final links = parseLinks(_urlCtrl.text);
+    if (links.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Paste at least one link first.')),
+      );
+      return;
+    }
     setState(() {
       _busy = true;
-      _result = null;
-      _error = null;
+      _items
+        ..clear()
+        ..addAll([for (final l in links) UrlItem(l)]);
     });
     try {
-      final res = await appState.api.uploadUrl(url);
-      if (!mounted) return;
-      setState(() {
-        _result = res;
-        _busy = false;
-      });
+      for (final item in _items) {
+        if (!mounted) return;
+        setState(() => item.status = UrlStatus.busy);
+        try {
+          final res = await appState.api.uploadUrl(
+            item.url,
+            enrich: appState.enrichURLs,
+            lyrics: appState.embedLyrics,
+            sort: appState.sortFolders,
+          );
+          if (!mounted) return;
+          setState(() {
+            item.status = UrlStatus.done;
+            item.result = res;
+          });
+          _recordHistory(item.url, res);
+          if (res.scanTriggered) {
+            unawaited(_verifyInLibrary(item, res));
+          }
+        } catch (e) {
+          if (!mounted) return;
+          setState(() {
+            item.status = UrlStatus.error;
+            item.message = e.toString();
+          });
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// One history entry per saved file: every entry of files[] when
+  /// the server returned a list (playlists, ZIPs), else the single
+  /// result itself.
+  void _recordHistory(String url, UploadResult res) {
+    void addOne(String savedAs, int size, bool scan) {
       appState.addHistory(HistoryItem(
-        name: res.savedAs.isNotEmpty ? res.savedAs : url,
+        name: savedAs.isNotEmpty ? savedAs : url,
         source: 'URL',
         at: DateTime.now(),
-        size: res.size,
-        scanTriggered: res.scanTriggered,
-        savedAs: res.savedAs,
+        size: size,
+        scanTriggered: scan,
+        savedAs: savedAs,
+        folder: res.folder,
       ));
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-        _busy = false;
-      });
     }
+
+    if (res.files.isNotEmpty) {
+      for (final f in res.files) {
+        addOne(f.savedAs, f.size, f.scanTriggered);
+      }
+    } else {
+      addOne(res.savedAs, res.size, res.scanTriggered);
+    }
+  }
+
+  /// A few seconds after a scan-triggered save, ask the server
+  /// whether Navidrome has indexed the track yet.
+  Future<void> _verifyInLibrary(UrlItem item, UploadResult res) async {
+    await Future<void>.delayed(const Duration(seconds: 5));
+    if (!mounted) return;
+    final title = res.matchedTitle ?? _searchTitle(res.savedAs);
+    try {
+      final m = await appState.api.inLibrary(title, '');
+      if (!mounted) return;
+      if (m.found) {
+        setState(() => item.libraryNote = 'In your Navidrome library ✓');
+      } else if (m.configured) {
+        setState(() =>
+            item.libraryNote = 'Saved — Navidrome has not indexed it yet');
+      }
+    } catch (_) {
+      // Confirmation is best-effort; the save itself already landed.
+    }
+  }
+
+  /// "Artist - Title.mp3" → "Artist Title" as a search hint.
+  static String _searchTitle(String savedAs) {
+    var name = savedAs;
+    final dot = name.lastIndexOf('.');
+    if (dot > 0) name = name.substring(0, dot);
+    return name.replaceAll(' - ', ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  Widget _urlRow(BuildContext context, UrlItem item) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final Widget trailing;
+    final List<String> lines = [];
+    switch (item.status) {
+      case UrlStatus.waiting:
+        trailing = const Icon(Icons.schedule);
+        lines.add('Waiting');
+      case UrlStatus.busy:
+        trailing = const SizedBox(
+          width: 26,
+          height: 26,
+          child: CircularProgressIndicator(strokeWidth: 3),
+        );
+        lines.add('Downloading — the server is fetching this link…');
+      case UrlStatus.done:
+        trailing = Icon(Icons.check_circle, color: Colors.green, size: 30);
+        final res = item.result!;
+        lines.add(res.scanTriggered
+            ? 'Saved as ${res.savedAs} · library scan started'
+            : 'Saved as ${res.savedAs}');
+        if (res.alsoSaved > 0) {
+          lines.add(res.alsoSaved == 1
+              ? '+ 1 more file from this link'
+              : '+ ${res.alsoSaved} more files from this link');
+        } else if (res.processingNotes.isNotEmpty) {
+          lines.add(res.processingNotes.join(' · '));
+        }
+        if (item.libraryNote != null) lines.add(item.libraryNote!);
+      case UrlStatus.error:
+        trailing = Icon(Icons.error, color: scheme.error, size: 30);
+        lines.add(item.message ?? 'Download failed');
+    }
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
+        child: Row(
+          children: [
+            Icon(Icons.link, size: 30, color: scheme.primary),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(item.url,
+                      style: theme.textTheme.titleMedium,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 6),
+                  Text(
+                    lines.join('\n'),
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: item.status == UrlStatus.error
+                          ? scheme.error
+                          : null,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            trailing,
+          ],
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final linkCount = parseLinks(_urlCtrl.text).length;
     return ListView(
       padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
       children: [
@@ -1204,12 +2007,13 @@ class _UrlPageState extends State<UrlPage> {
                 controller: _urlCtrl,
                 style: theme.textTheme.bodyLarge,
                 decoration: const InputDecoration(
-                  labelText: 'URL',
+                  labelText: 'URLs',
                   hintText: 'https://…',
                   border: OutlineInputBorder(),
                 ),
-                keyboardType: TextInputType.url,
-                onSubmitted: (_) => unawaited(_submit()),
+                keyboardType: TextInputType.multiline,
+                minLines: 3,
+                maxLines: 8,
               ),
             ),
             const SizedBox(width: 12),
@@ -1228,58 +2032,31 @@ class _UrlPageState extends State<UrlPage> {
             ),
           ],
         ),
+        const SizedBox(height: 14),
+        Text(
+          'One link per line. A YouTube playlist link adds every '
+          'track in it (up to 50).',
+          style: theme.textTheme.bodyMedium
+              ?.copyWith(color: scheme.onSurfaceVariant),
+        ),
         const SizedBox(height: 18),
         Align(
           alignment: Alignment.centerLeft,
           child: FilledButton.icon(
             onPressed: _busy ? null : _submit,
             icon: const Icon(Icons.download),
-            label: const Text('Download to Navidrome'),
+            label: Text(linkCount > 1
+                ? 'Download $linkCount links'
+                : 'Download to Navidrome'),
           ),
         ),
         if (_busy) ...[
-          const SizedBox(height: 26),
+          const SizedBox(height: 20),
           const LinearProgressIndicator(),
+        ],
+        if (_items.isNotEmpty) ...[
           const SizedBox(height: 10),
-          Text(
-            'The server is fetching that link — page links can take a '
-            'little while.',
-            style: theme.textTheme.bodyMedium
-                ?.copyWith(color: scheme.onSurfaceVariant),
-          ),
-        ],
-        if (_result != null) ...[
-          const SizedBox(height: 26),
-          Card(
-            child: ListTile(
-              leading:
-                  const Icon(Icons.check_circle, color: Colors.green, size: 34),
-              title: Text('Saved as ${_result!.savedAs}',
-                  style: theme.textTheme.titleMedium),
-              subtitle: Text(
-                [
-                  if (_result!.size > 0) formatBytes(_result!.size),
-                  if (_result!.scanTriggered) 'Library scan started',
-                ].join(' · '),
-                style: theme.textTheme.bodyMedium,
-              ),
-            ),
-          ),
-        ],
-        if (_error != null) ...[
-          const SizedBox(height: 26),
-          Card(
-            child: ListTile(
-              leading: Icon(Icons.error, color: scheme.error, size: 34),
-              title:
-                  Text('Download failed', style: theme.textTheme.titleMedium),
-              subtitle: Text(
-                _error!,
-                style: theme.textTheme.bodyMedium
-                    ?.copyWith(color: scheme.error),
-              ),
-            ),
-          ),
+          for (final item in _items) _urlRow(context, item),
         ],
       ],
     );
@@ -1290,8 +2067,55 @@ class _UrlPageState extends State<UrlPage> {
 // History page: everything this app has uploaded, newest first
 // ---------------------------------------------------------------------------
 
-class HistoryPage extends StatelessWidget {
+class HistoryPage extends StatefulWidget {
   const HistoryPage({super.key});
+
+  @override
+  State<HistoryPage> createState() => _HistoryPageState();
+}
+
+class _HistoryPageState extends State<HistoryPage> {
+  // The server's own upload log, fetched once when the page is
+  // created and merged into the display in memory (local history
+  // storage stays exactly as it was).
+  List<HistoryItem> _serverEntries = [];
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadServer());
+  }
+
+  Future<void> _loadServer() async {
+    while (!appState.booted) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      if (!mounted) return;
+    }
+    try {
+      final entries = await appState.api.fetchRecent();
+      if (!mounted) return;
+      setState(() => _serverEntries = entries);
+    } catch (_) {
+      // Server history is a bonus; local history still shows.
+    }
+  }
+
+  /// Local entries plus server entries that are not already here:
+  /// a server entry matching a local one on name + size within
+  /// 10 minutes is the same upload seen from both sides.
+  List<HistoryItem> get _merged {
+    final local = appState.history;
+    final merged = [...local];
+    for (final s in _serverEntries) {
+      final duplicate = local.any((l) =>
+          l.name == s.name &&
+          l.size == s.size &&
+          l.at.difference(s.at).inMinutes.abs() <= 10);
+      if (!duplicate) merged.add(s);
+    }
+    merged.sort((a, b) => b.at.compareTo(a.at));
+    return merged;
+  }
 
   Future<void> _confirmClear(BuildContext context) async {
     final ok = await showDialog<bool>(
@@ -1322,7 +2146,7 @@ class HistoryPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final items = appState.history;
+    final items = _merged;
     return ListView(
       padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
       children: [
@@ -1364,13 +2188,29 @@ class HistoryPage extends StatelessWidget {
                   size: 30,
                   color: scheme.primary,
                 ),
-                title: Text(h.name, style: theme.textTheme.titleMedium),
+                title: Row(
+                  children: [
+                    Expanded(
+                      child: Text(h.name,
+                          style: theme.textTheme.titleMedium),
+                    ),
+                    if (h.fromServer) ...[
+                      const SizedBox(width: 10),
+                      Chip(
+                        label: const Text('Server'),
+                        labelStyle: theme.textTheme.bodySmall,
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ],
+                  ],
+                ),
                 subtitle: Text(
                   [
                     h.source,
                     formatDateTime(h.at),
                     if (h.size > 0) formatBytes(h.size),
                     h.scanTriggered ? 'Scan started' : 'Scan pending',
+                    if (h.folder.isNotEmpty) 'Filed under ${h.folder}',
                   ].join(' · '),
                   style: theme.textTheme.bodyMedium,
                 ),
@@ -1433,6 +2273,20 @@ class _SettingsPageState extends State<SettingsPage> {
   void _snack(String text) {
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Widget _switchRow(BuildContext context, String label, bool value,
+      ValueChanged<bool> onChanged) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Expanded(child: Text(label, style: theme.textTheme.bodyLarge)),
+          Switch(value: value, onChanged: onChanged),
+        ],
+      ),
+    );
   }
 
   /// "Saved (N characters)" note under a debrid key field, or nothing
@@ -1609,6 +2463,30 @@ class _SettingsPageState extends State<SettingsPage> {
             child: const Text('Save Premiumize key'),
           ),
         ),
+        const _SectionHeader('Processing'),
+        _switchRow(context, 'Clean up metadata — URL downloads',
+            appState.enrichURLs, (v) => appState.setEnrichURLs(v)),
+        _switchRow(context, 'Clean up metadata — file uploads',
+            appState.enrichFiles, (v) => appState.setEnrichFiles(v)),
+        _switchRow(context, 'Fetch & embed lyrics', appState.embedLyrics,
+            (v) => appState.setEmbedLyrics(v)),
+        _switchRow(context, 'File into Artist / Album folders',
+            appState.sortFolders, (v) => appState.setSortFolders(v)),
+        _switchRow(context, 'Skip songs already in the library',
+            appState.skipDuplicates, (v) => appState.setSkipDuplicates(v)),
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Text(
+            'The server identifies each song (iTunes, then MusicBrainz '
+            '+ Cover Art Archive) and embeds proper title, artist, '
+            'album and cover art into the audio file. Lyrics come from '
+            'LRCLIB and are embedded into the file too. File uploads '
+            'are left untagged by default — albums usually arrive '
+            'already tagged.',
+            style: theme.textTheme.bodyMedium
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ),
         const _SectionHeader('Connection'),
         Align(
           alignment: Alignment.centerLeft,
@@ -1694,7 +2572,7 @@ class _SettingsPageState extends State<SettingsPage> {
         Card(
           child: ListTile(
             leading: const AppIconBadge(size: 40),
-            title: Text('NaviUpload 1.0.0', style: theme.textTheme.titleMedium),
+            title: Text('NaviUpload 0.2.0', style: theme.textTheme.titleMedium),
             subtitle: Text(
               'Upload music to your Navidrome library from files or '
               'URLs.',
