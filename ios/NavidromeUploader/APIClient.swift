@@ -101,24 +101,78 @@ struct APIClient {
 
     // MARK: Token check
 
-    private struct RecentProbe: Decodable {
-        struct Item: Decodable {}
-        let uploads: [Item]?
-    }
-
     /// GET /health needs no token, so it cannot prove the token is
     /// right. This probes GET /recent (authenticated): it throws the
     /// server's 401 when the saved token is missing or wrong.
     func verifyToken() async throws {
+        _ = try await recentUploads()
+    }
+
+    /// GET /recent — the server's own upload log (newest first).
+    func recentUploads() async throws -> [ServerRecentEntry] {
         var req = try request(for: "recent")
         req.httpMethod = "GET"
         let (data, response) = try await URLSession.shared.data(for: req)
-        _ = try decode(RecentProbe.self, data: data, response: response)
+        return try decode(RecentResponse.self, data: data, response: response).uploads
+    }
+
+    // MARK: Library operations (0.2.0 server)
+
+    /// POST /scan — the in-app "refresh the library" button.
+    func scanLibrary() async throws -> ScanResponse {
+        var req = try request(for: "scan")
+        req.httpMethod = "POST"
+        let (data, response) = try await URLSession.shared.data(for: req)
+        return try decode(ScanResponse.self, data: data, response: response)
+    }
+
+    /// GET /stats — songs in the library + all-time upload totals.
+    func stats() async throws -> StatsResponse {
+        var req = try request(for: "stats")
+        req.httpMethod = "GET"
+        let (data, response) = try await URLSession.shared.data(for: req)
+        return try decode(StatsResponse.self, data: data, response: response)
+    }
+
+    /// POST /check — which of these (name, size) pairs are already in
+    /// the library (exact name match, or an exact size match)?
+    func checkDuplicates(items: [(name: String, size: Int)]) async throws -> [CheckResponse.Result] {
+        var req = try request(for: "check")
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let payload: [String: Any] = ["items": items.map {
+            ["name": $0.name, "size": $0.size]
+        }]
+        req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        return try decode(CheckResponse.self, data: data, response: response).results
+    }
+
+    /// GET /in-library — has Navidrome actually indexed this track?
+    func inLibrary(title: String, artist: String) async throws -> InLibraryResponse {
+        guard let baseURL else { throw APIError.invalidBaseURL(baseURLString) }
+        var components = URLComponents(url: baseURL.appendingPathComponent("in-library"),
+                                       resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "title", value: title),
+            URLQueryItem(name: "artist", value: artist),
+        ]
+        guard let url = components?.url else { throw APIError.invalidBaseURL(baseURLString) }
+        var req = URLRequest(url: url)
+        if !token.isEmpty {
+            req.setValue(token, forHTTPHeaderField: "X-Upload-Token")
+        }
+        req.httpMethod = "GET"
+        let (data, response) = try await URLSession.shared.data(for: req)
+        return try decode(InLibraryResponse.self, data: data, response: response)
     }
 
     // MARK: URL upload
 
-    func uploadFromURL(_ urlString: String) async throws -> UploadResponse {
+    func uploadFromURL(_ urlString: String,
+                       enrich: Bool = true,
+                       lyrics: Bool = true,
+                       sort: Bool = false) async throws -> UploadResponse {
         var req = try request(for: "url")
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -130,16 +184,31 @@ struct APIClient {
         if !premiumizeKey.isEmpty {
             req.setValue(premiumizeKey, forHTTPHeaderField: "X-Premiumize-Key")
         }
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["url": urlString])
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "url": urlString, "enrich": enrich, "lyrics": lyrics, "sort": sort,
+        ])
         let (data, response) = try await URLSession.shared.data(for: req)
         return try decode(UploadResponse.self, data: data, response: response)
     }
 
     // MARK: File upload (progress-capable)
 
-    /// Uploads the file at `fileURL` as multipart/form-data (field "file"),
-    /// reporting send progress (0...1) on the main actor as it goes.
+    /// When the app registers a background uploader (see
+    /// BackgroundUploads.swift), file uploads run on a background
+    /// URLSession so they survive the app being suspended. The share
+    /// extension never registers one and uses the inline session.
+    /// Signature: (request, bodyFile, progress) -> (data, response).
+    nonisolated(unsafe) static var backgroundUploadFunction:
+        ((URLRequest, URL, @escaping @MainActor (Double) -> Void)
+            async throws -> (Data, URLResponse))?
+
+    /// Uploads the file at `fileURL` as multipart/form-data (field "file",
+    /// plus the processing flags as plain form fields), reporting send
+    /// progress (0...1) on the main actor as it goes.
     func uploadFile(fileURL: URL,
+                    enrich: Bool = false,
+                    lyrics: Bool = false,
+                    sort: Bool = false,
                     progress: @escaping @MainActor (Double) -> Void) async throws -> UploadResponse {
         var req = try request(for: "upload")
         req.httpMethod = "POST"
@@ -160,12 +229,27 @@ struct APIClient {
                      forHTTPHeaderField: "Content-Type")
 
         var body = Data()
+        for (field, value) in [("enrich", enrich), ("lyrics", lyrics), ("sort", sort)] {
+            body.append("--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"\(field)\"\r\n\r\n".data(using: .utf8)!)
+            body.append("\(value ? "true" : "false")\r\n".data(using: .utf8)!)
+        }
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
         let disposition = "Content-Disposition: form-data; name=\"file\"; filename=\"\(fileURL.lastPathComponent)\"\r\n"
         body.append(disposition.data(using: .utf8)!)
         body.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
         body.append(fileData)
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+
+        // Background path: the session needs the body in a file.
+        if let backgroundUpload = Self.backgroundUploadFunction {
+            let bodyFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("naviupload-\(UUID().uuidString).body")
+            try body.write(to: bodyFile)
+            defer { try? FileManager.default.removeItem(at: bodyFile) }
+            let (data, response) = try await backgroundUpload(req, bodyFile, progress)
+            return try decode(UploadResponse.self, data: data, response: response)
+        }
 
         let delegate = ProgressUploadDelegate(progress: progress)
         let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)

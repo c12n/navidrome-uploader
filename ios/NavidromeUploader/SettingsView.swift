@@ -15,6 +15,9 @@ struct SettingsView: View {
     @State private var isTesting = false
     @State private var testResult: String?
     @State private var testSucceeded = false
+    @State private var showSetupQR = false
+    @State private var showSetupScanner = false
+    @State private var setupNote: String?
 
     var body: some View {
         @Bindable var settings = settings
@@ -59,6 +62,44 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("Clean up metadata \u{2014} URL downloads",
+                           isOn: $settings.enrichURLs)
+                    Toggle("Clean up metadata \u{2014} file uploads",
+                           isOn: $settings.enrichFiles)
+                    Toggle("Fetch & embed lyrics", isOn: $settings.embedLyrics)
+                    Toggle("File into Artist / Album folders",
+                           isOn: $settings.sortFolders)
+                    Toggle("Skip songs already in the library",
+                           isOn: $settings.skipDuplicates)
+                } header: {
+                    Text("Processing")
+                } footer: {
+                    Text("The server identifies each song (iTunes, then MusicBrainz + Cover Art Archive) and embeds proper title, artist, album and cover art into the audio file. Lyrics come from LRCLIB and are embedded into the file too, so they show in any player. File uploads are left untagged by default \u{2014} albums usually arrive already tagged.")
+                }
+
+                Section {
+                    Button {
+                        showSetupQR = true
+                    } label: {
+                        Label("Show my setup QR code", systemImage: "qrcode")
+                    }
+                    Button {
+                        showSetupScanner = true
+                    } label: {
+                        Label("Scan a setup QR code", systemImage: "qrcode.viewfinder")
+                    }
+                    if let setupNote {
+                        Text(setupNote)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Setup code")
+                } footer: {
+                    Text("Move this server + token to another device in one scan. The code contains your token \u{2014} treat it like a password.")
+                }
+
+                Section {
                     Button {
                         testConnection()
                     } label: {
@@ -90,6 +131,17 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .sheet(isPresented: $showSetupQR) {
+                ShowSetupCodeView()
+            }
+            .sheet(isPresented: $showSetupScanner) {
+                ScanSetupCodeView { payload in
+                    settings.baseURLString = payload.server
+                    settings.token = payload.token
+                    showSetupScanner = false
+                    setupNote = "Setup applied from the scanned code \u{2014} run Test connection to confirm."
+                }
+            }
         }
     }
 

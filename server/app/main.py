@@ -36,6 +36,7 @@ Copyright (c) 2026 c12n Apps
 """
 
 import asyncio
+import difflib
 import hashlib
 import json
 import os
@@ -44,12 +45,14 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import zipfile
 
 import httpx
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import (FastAPI, File, Form, Header, HTTPException, Request,
+                     UploadFile)
 from fastapi.responses import JSONResponse
 
 AUDIO_EXTS = {
@@ -98,14 +101,16 @@ def sanitize_filename(name: str) -> str:
     return stem + ext
 
 
-def unique_path(filename: str) -> str:
-    path = os.path.join(LIBRARY_DIR, filename)
+def unique_path(filename: str, subdir: str = "") -> str:
+    folder = os.path.join(LIBRARY_DIR, subdir) if subdir else LIBRARY_DIR
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, filename)
     if not os.path.exists(path):
         return path
     stem, ext = os.path.splitext(filename)
     n = 2
     while True:
-        candidate = os.path.join(LIBRARY_DIR, f"{stem} ({n}){ext}")
+        candidate = os.path.join(folder, f"{stem} ({n}){ext}")
         if not os.path.exists(candidate):
             return candidate
         n += 1
@@ -148,7 +153,8 @@ def record(entry: dict) -> None:
         pass
 
 
-async def finish_save(tmp_path: str, filename: str, source: str) -> dict:
+async def finish_save(tmp_path: str, filename: str, source: str,
+                      subdir: str = "") -> dict:
     if os.path.splitext(filename)[1].lower() not in AUDIO_EXTS:
         os.unlink(tmp_path)
         raise HTTPException(415, f"Not an audio file we can add: {filename}")
@@ -156,12 +162,14 @@ async def finish_save(tmp_path: str, filename: str, source: str) -> dict:
     if size == 0:
         os.unlink(tmp_path)
         raise HTTPException(400, "Downloaded / uploaded file is empty")
-    dest = unique_path(sanitize_filename(filename))
+    dest = unique_path(sanitize_filename(filename), subdir)
     shutil.move(tmp_path, dest)
+    bump_stats(size)
     scan = await trigger_scan()
     entry = {
         "saved_as": os.path.basename(dest), "size": size,
         "source": source, "scan_triggered": scan, "at": int(time.time()),
+        "folder": subdir,
     }
     record(entry)
     return entry
@@ -198,6 +206,9 @@ async def recent(x_upload_token: str | None = Header(default=None)) -> dict:
 @app.post("/upload")
 async def upload(
     file: UploadFile = File(...),
+    enrich: str = Form("false"),
+    lyrics: str = Form("false"),
+    sort: str = Form("false"),
     x_upload_token: str | None = Header(default=None),
 ) -> dict:
     require_token(x_upload_token)
@@ -217,7 +228,446 @@ async def upload(
     except HTTPException:
         os.unlink(tmp)
         raise
-    return await finish_save(tmp, file.filename or "upload", "file")
+    return await save_processed(tmp, file.filename or "upload", "file",
+                                _flag(enrich), _flag(lyrics), _flag(sort))
+
+
+# ------------------------------------------- metadata enrichment (0.2.0) --
+# After a file arrives (upload or download) the server can identify the
+# track — iTunes Search first (keyless, has 600px artwork), MusicBrainz
+# + Cover Art Archive as fallback — and embed proper tags + cover art
+# into the file with mutagen, Picard-style. Lyrics come from LRCLIB
+# (keyless) and are embedded into the file too (ID3 USLT / MP4 ©lyr /
+# Vorbis LYRICS). Everything is best-effort: a failed lookup never
+# blocks or breaks the save.
+
+ITUNES_API_BASE = os.environ.get(
+    "ITUNES_API_BASE", "https://itunes.apple.com").rstrip("/")
+MUSICBRAINZ_API_BASE = os.environ.get(
+    "MUSICBRAINZ_API_BASE", "https://musicbrainz.org/ws/2").rstrip("/")
+COVERART_API_BASE = os.environ.get(
+    "COVERART_API_BASE", "https://coverartarchive.org").rstrip("/")
+LRCLIB_API_BASE = os.environ.get(
+    "LRCLIB_API_BASE", "https://lrclib.net/api").rstrip("/")
+META_UA = {"User-Agent":
+           "NaviUpload/0.2.0 (https://github.com/c12n/navidrome-uploader)"}
+
+try:
+    import mutagen
+    from mutagen.flac import FLAC, Picture
+    from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TRCK, USLT
+    from mutagen.mp4 import MP4, MP4Cover
+    _HAS_MUTAGEN = True
+except Exception:  # pragma: no cover - mutagen ships in requirements
+    _HAS_MUTAGEN = False
+
+
+def _tag_get(audio, *keys) -> str:
+    for k in keys:
+        try:
+            v = audio.get(k)
+        except Exception:
+            v = None
+        if v:
+            if isinstance(v, list):
+                return str(v[0])
+            return str(v)
+    return ""
+
+
+def read_tags(path: str) -> dict:
+    out = {"title": "", "artist": "", "album": "", "duration": 0.0}
+    if not _HAS_MUTAGEN:
+        return out
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        return out
+    if audio is None:
+        return out
+    try:
+        out["duration"] = float(audio.info.length or 0)
+    except Exception:
+        pass
+    out["title"] = _tag_get(audio, "TIT2", "\xa9nam", "title", "TITLE")
+    out["artist"] = _tag_get(audio, "TPE1", "\xa9ART", "artist", "ARTIST")
+    out["album"] = _tag_get(audio, "TALB", "\xa9alb", "album", "ALBUM")
+    return out
+
+
+def _cover_mime(data: bytes) -> str:
+    return "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+
+
+def write_tags(path: str, meta: dict | None, cover: bytes | None,
+               lyrics: str | None) -> bool:
+    """Embed tags / cover art / lyrics into the audio file itself."""
+    if not _HAS_MUTAGEN:
+        return False
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".mp3":
+            try:
+                tags = ID3(path)
+            except Exception:
+                tags = ID3()
+            if meta:
+                for frame, key in (("TIT2", "title"), ("TPE1", "artist"),
+                                   ("TALB", "album")):
+                    if meta.get(key):
+                        tags.delall(frame)
+                        tags.add({"TIT2": TIT2, "TPE1": TPE1,
+                                  "TALB": TALB}[frame](
+                                      encoding=3, text=meta[key]))
+                if meta.get("year"):
+                    tags.delall("TDRC")
+                    tags.add(TDRC(encoding=3, text=str(meta["year"])))
+                if meta.get("track"):
+                    tags.delall("TRCK")
+                    tags.add(TRCK(encoding=3, text=str(meta["track"])))
+            if cover:
+                tags.delall("APIC")
+                tags.add(APIC(encoding=3, mime=_cover_mime(cover), type=3,
+                              desc="Cover", data=cover))
+            if lyrics:
+                tags.delall("USLT")
+                tags.add(USLT(encoding=3, lang="eng", text=lyrics))
+            tags.save(path)
+            return True
+        if ext in (".m4a", ".mp4"):
+            audio = MP4(path)
+            if audio.tags is None:
+                audio.add_tags()
+            if meta:
+                if meta.get("title"):
+                    audio["\xa9nam"] = [meta["title"]]
+                if meta.get("artist"):
+                    audio["\xa9ART"] = [meta["artist"]]
+                if meta.get("album"):
+                    audio["\xa9alb"] = [meta["album"]]
+                if meta.get("year"):
+                    audio["\xa9day"] = [str(meta["year"])]
+                if meta.get("track"):
+                    audio["trkn"] = [(int(meta["track"]), 0)]
+            if cover:
+                fmt = (MP4Cover.FORMAT_PNG
+                       if _cover_mime(cover) == "image/png"
+                       else MP4Cover.FORMAT_JPEG)
+                audio["covr"] = [MP4Cover(cover, imageformat=fmt)]
+            if lyrics:
+                audio["\xa9lyr"] = [lyrics]
+            audio.save()
+            return True
+        if ext == ".flac":
+            audio = FLAC(path)
+            if meta:
+                for key, field in (("title", "title"), ("artist", "artist"),
+                                   ("album", "album"), ("date", "year"),
+                                   ("tracknumber", "track")):
+                    if meta.get(field):
+                        audio[key] = [str(meta[field])]
+            if cover:
+                pic = Picture()
+                pic.data = cover
+                pic.type = 3
+                pic.mime = _cover_mime(cover)
+                audio.clear_pictures()
+                audio.add_picture(pic)
+            if lyrics:
+                audio["LYRICS"] = [lyrics]
+            audio.save()
+            return True
+        if ext in (".ogg", ".oga", ".opus"):
+            audio = mutagen.File(path)
+            if audio is not None:
+                if meta:
+                    for key, field in (("TITLE", "title"),
+                                       ("ARTIST", "artist"),
+                                       ("ALBUM", "album"),
+                                       ("DATE", "year"),
+                                       ("TRACKNUMBER", "track")):
+                        if meta.get(field):
+                            audio[key] = [str(meta[field])]
+                if lyrics:
+                    audio["LYRICS"] = [lyrics]
+                audio.save()
+                return True
+    except Exception:
+        return False
+    return False
+
+
+_JUNK = re.compile(
+    r"\[[^\]]*\]|"
+    r"\((?:official|lyric|audio|video|hd|hq|mv|visualizer|remaster|explicit|"
+    r"dirty|clean)[^)]*\)", re.I)
+
+
+def clean_title(raw: str) -> str:
+    s = _JUNK.sub(" ", raw or "")
+    return re.sub(r"\s+", " ", s).strip(" -")
+
+
+def split_artist_title(stem: str) -> tuple:
+    stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem or "")
+    if " - " in stem:
+        a, t = stem.split(" - ", 1)
+        return a.strip(), clean_title(t)
+    return "", clean_title(stem)
+
+
+def _sim(a: str, b: str) -> float:
+    def norm(s):
+        return re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
+    a, b = norm(a), norm(b)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+async def _identify_itunes(title: str, artist: str) -> dict | None:
+    query = f"{artist} {title}".strip()
+    if not query:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
+            r = await c.get(f"{ITUNES_API_BASE}/search", headers=META_UA,
+                            params={"term": query, "media": "music",
+                                    "entity": "song", "limit": 5})
+            r.raise_for_status()
+            results = r.json().get("results") or []
+    except Exception:
+        return None
+    best, best_score = None, 0.0
+    for it in results:
+        s = 0.65 * _sim(title, it.get("trackName") or "")
+        s += 0.35 * (_sim(artist, it.get("artistName") or "")
+                     if artist else 0.7)
+        if s > best_score:
+            best, best_score = it, s
+    if best is None or best_score < 0.72:
+        return None
+    art = (best.get("artworkUrl100") or "").replace(
+        "100x100bb.jpg", "600x600bb.jpg")
+    return {"title": best.get("trackName") or title,
+            "artist": best.get("artistName") or artist,
+            "album": best.get("collectionName") or "",
+            "year": (best.get("releaseDate") or "")[:4],
+            "track": best.get("trackNumber"),
+            "cover_url": art or None, "source": "itunes"}
+
+
+async def _identify_musicbrainz(title: str, artist: str) -> dict | None:
+    if not title:
+        return None
+    query = f'recording:"{title}"'
+    if artist:
+        query += f' AND artist:"{artist}"'
+    try:
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
+            r = await c.get(f"{MUSICBRAINZ_API_BASE}/recording/",
+                            headers=META_UA,
+                            params={"query": query, "fmt": "json",
+                                    "limit": 5})
+            r.raise_for_status()
+            recs = r.json().get("recordings") or []
+    except Exception:
+        return None
+    for rec in recs:
+        if (rec.get("score") or 0) < 80:
+            continue
+        if _sim(title, rec.get("title") or "") < 0.6:
+            continue
+        credit = rec.get("artist-credit") or []
+        artist_name = "".join(
+            (c.get("name") or "") + (c.get("joinphrase") or "")
+            for c in credit).strip() or artist
+        releases = rec.get("releases") or []
+        album, release_id = "", None
+        if releases:
+            album = releases[0].get("title") or ""
+            release_id = releases[0].get("id")
+        cover = None
+        if release_id:
+            try:
+                async with httpx.AsyncClient(
+                        timeout=20, trust_env=False,
+                        follow_redirects=True) as c:
+                    cr = await c.get(
+                        f"{COVERART_API_BASE}/release/{release_id}/front-500",
+                        headers=META_UA)
+                    if cr.status_code == 200 and len(cr.content) < 3_000_000:
+                        cover = cr.content
+            except Exception:
+                cover = None
+        return {"title": rec.get("title") or title,
+                "artist": artist_name,
+                "album": album,
+                "year": (rec.get("first-release-date") or "")[:4],
+                "track": None, "cover_bytes": cover,
+                "source": "musicbrainz"}
+    return None
+
+
+async def _fetch_lyrics(title: str, artist: str,
+                        duration: float) -> str | None:
+    """Plain lyrics from LRCLIB (no key needed). When only the synced
+    version exists, its timestamps are stripped."""
+    if not title:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
+            params = {"track_name": title, "artist_name": artist or ""}
+            if duration and duration > 0:
+                params["duration"] = int(duration)
+            r = await c.get(f"{LRCLIB_API_BASE}/get", params=params,
+                            headers=META_UA)
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("plainLyrics"):
+                    return j["plainLyrics"]
+                if j.get("syncedLyrics"):
+                    return re.sub(r"\[\d+:\d+(?:\.\d+)?\]\s?", "",
+                                  j["syncedLyrics"]).strip() or None
+            r = await c.get(f"{LRCLIB_API_BASE}/search",
+                            params={"track_name": title,
+                                    "artist_name": artist or ""},
+                            headers=META_UA)
+            if r.status_code == 200:
+                for item in r.json() or []:
+                    if item.get("plainLyrics"):
+                        return item["plainLyrics"]
+    except Exception:
+        return None
+    return None
+
+
+async def enrich_file(path: str, want_meta: bool, want_lyrics: bool,
+                      display_name: str = "") -> dict:
+    """Identify the track, then embed proper tags, cover art and
+    lyrics into the file. Best-effort: failures leave the file as-is.
+    display_name is the name the user knows the file by (uploads sit in
+    a random temp file on disk, so their own stem is meaningless)."""
+    report = {"matched": False, "source": None,
+              "lyrics_embedded": False, "title": None}
+    if not _HAS_MUTAGEN or (not want_meta and not want_lyrics):
+        return report
+    tags = read_tags(path)
+    stem = os.path.splitext(display_name or os.path.basename(path))[0]
+    f_artist, f_title = split_artist_title(stem)
+    title = clean_title(tags["title"]) or f_title
+    artist = tags["artist"] or f_artist
+    meta, cover = None, None
+    if want_meta:
+        meta = await _identify_itunes(title, artist)
+        if meta is None:
+            meta = await _identify_musicbrainz(title, artist)
+        if meta:
+            report["matched"] = True
+            report["source"] = meta["source"]
+            report["title"] = meta["title"]
+            cover = meta.pop("cover_bytes", None)
+            url = meta.pop("cover_url", None)
+            if cover is None and url:
+                try:
+                    async with httpx.AsyncClient(
+                            timeout=20, trust_env=False,
+                            follow_redirects=True) as c:
+                        cr = await c.get(url, headers=META_UA)
+                        if cr.status_code == 200 and len(cr.content) < 3_000_000:
+                            cover = cr.content
+                except Exception:
+                    cover = None
+    lyrics = None
+    if want_lyrics:
+        lyrics = await _fetch_lyrics(
+            meta["title"] if meta else title,
+            meta["artist"] if meta else artist,
+            tags["duration"])
+    if meta or lyrics:
+        if write_tags(path, meta, cover, lyrics) and lyrics:
+            report["lyrics_embedded"] = True
+    return report
+
+
+# ------------------------------------------------------ upload statistics --
+
+_stats_lock = threading.Lock()
+
+
+def _stats_file() -> str:
+    return os.path.join(DATA_DIR, "upload_stats.json")
+
+
+def read_stats() -> dict:
+    try:
+        with open(_stats_file(), encoding="utf-8") as fh:
+            s = json.load(fh)
+        return {"uploaded_total": int(s.get("uploaded_total", 0)),
+                "uploaded_bytes": int(s.get("uploaded_bytes", 0)),
+                "last_upload_at": s.get("last_upload_at")}
+    except Exception:
+        return {"uploaded_total": 0, "uploaded_bytes": 0,
+                "last_upload_at": None}
+
+
+def bump_stats(size: int) -> None:
+    with _stats_lock:
+        s = read_stats()
+        s["uploaded_total"] += 1
+        s["uploaded_bytes"] += int(size)
+        s["last_upload_at"] = int(time.time())
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = _stats_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(s, fh)
+        os.replace(tmp, _stats_file())
+
+
+def library_index() -> tuple:
+    """(lowercased audio filenames, audio file sizes) library-wide."""
+    names, sizes = set(), set()
+    for root, _dirs, files in os.walk(LIBRARY_DIR):
+        for f in files:
+            if os.path.splitext(f)[1].lower() in AUDIO_EXTS:
+                names.add(f.lower())
+                try:
+                    sizes.add(os.path.getsize(os.path.join(root, f)))
+                except OSError:
+                    pass
+    return names, sizes
+
+
+def _sort_subdir(path: str) -> str:
+    """'Artist/Album' from the file's (possibly enriched) tags."""
+    t = read_tags(path)
+    artist = sanitize_filename(t["artist"]) if t["artist"] else ""
+    album = sanitize_filename(t["album"]) if t["album"] else ""
+    if artist and album:
+        return f"{artist}/{album}"
+    return artist
+
+
+async def save_processed(local: str, fname: str, source: str,
+                         want_meta: bool, want_lyrics: bool,
+                         sort: bool) -> dict:
+    """Enrich (optional) -> sort into Artist/Album (optional) -> save."""
+    report = {"matched": False, "source": None,
+              "lyrics_embedded": False, "title": None}
+    if want_meta or want_lyrics:
+        report = await enrich_file(local, want_meta, want_lyrics, fname)
+    subdir = _sort_subdir(local) if sort else ""
+    entry = await finish_save(local, fname, source, subdir)
+    entry["enriched"] = report["matched"]
+    entry["metadata_source"] = report["source"]
+    entry["lyrics_embedded"] = report["lyrics_embedded"]
+    if report["title"]:
+        entry["matched_title"] = report["title"]
+    return entry
+
+
+def _flag(value) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------- TorBox --
@@ -470,22 +920,31 @@ async def fetch_with_premiumize(url: str, workdir: str, key: str = "") -> list:
     return results
 
 
-def fetch_with_ytdlp(url: str, workdir: str) -> str:
+def fetch_with_ytdlp(url: str, workdir: str) -> list:
+    """Download with yt-dlp -> MP3. Playlist URLs expand to every entry
+    (first 50), each its own file, in playlist order."""
     if not shutil.which("yt-dlp"):
         raise HTTPException(
             501, "This link needs yt-dlp, which is not installed on the server")
+    is_playlist = "list=" in url or "/playlist" in url
+    if is_playlist:
+        extra = ["--playlist-end", "50", "-o",
+                 os.path.join(workdir, "%(playlist_index)03d - %(title)s.%(ext)s")]
+    else:
+        extra = ["--no-playlist", "-o",
+                 os.path.join(workdir, "%(title)s.%(ext)s")]
     proc = subprocess.run(
         ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
-         "--no-playlist", "-o", os.path.join(workdir, "%(title)s.%(ext)s"), url],
-        capture_output=True, text=True, timeout=1200,
+         *extra, url],
+        capture_output=True, text=True, timeout=1800,
     )
-    produced = [os.path.join(workdir, f) for f in os.listdir(workdir)
-                if f.lower().endswith(".mp3")]
+    produced = sorted(os.path.join(workdir, f) for f in os.listdir(workdir)
+                      if f.lower().endswith(".mp3"))
     if proc.returncode != 0 or not produced:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()
         raise HTTPException(502, "yt-dlp could not fetch that link: "
                             + (tail[-1] if tail else "unknown error"))
-    return produced[0]
+    return produced
 
 
 @app.post("/url")
@@ -503,6 +962,12 @@ async def upload_url(
     url = (body or {}).get("url", "").strip()
     if not url or not re.match(r"^https?://", url):
         raise HTTPException(400, "Give a valid http(s) URL")
+    # Optional processing flags (JSON booleans): identify + tag the
+    # downloads (default on), embed lyrics (default on), file them
+    # under Artist/Album folders (default off).
+    want_meta = _flag(body.get("enrich", True))
+    want_lyrics = _flag(body.get("lyrics", True))
+    want_sort = _flag(body.get("sort", False))
 
     os.makedirs(DATA_DIR, exist_ok=True)
     workdir = tempfile.mkdtemp(dir=DATA_DIR)
@@ -511,7 +976,8 @@ async def upload_url(
         if os.path.splitext(direct_name)[1].lower() in AUDIO_EXTS:
             tmp = os.path.join(workdir, direct_name)
             await _download_to_file(url, tmp)
-            return await finish_save(tmp, direct_name, "url")
+            return await save_processed(tmp, direct_name, "url",
+                                        want_meta, want_lyrics, want_sort)
 
         # Debrid routes first when the link is on a provider's hoster
         # list and that provider's key is available: TorBox, then
@@ -530,25 +996,119 @@ async def upload_url(
             try:
                 saved = []
                 for local, fname in await fetch(url, workdir, key):
-                    saved.append(await finish_save(local, fname, "url"))
+                    saved.append(await save_processed(
+                        local, fname, "url",
+                        want_meta, want_lyrics, want_sort))
                 first = saved[0]
                 first["via"] = label
                 if len(saved) > 1:
                     first["also_saved"] = len(saved) - 1
+                    first["files"] = [dict(e) for e in saved]
                 return first
             except HTTPException as exc:
                 provider_error = provider_error or exc
 
         # Anything else (YouTube, SoundCloud, a page link): yt-dlp -> MP3.
         try:
-            produced = fetch_with_ytdlp(url, workdir)
+            produced_files = fetch_with_ytdlp(url, workdir)
         except HTTPException:
             if provider_error is not None:
                 raise provider_error
             raise
-        return await finish_save(produced, os.path.basename(produced), "url")
+        saved = []
+        for produced in produced_files:
+            saved.append(await save_processed(
+                produced, os.path.basename(produced), "url",
+                want_meta, want_lyrics, want_sort))
+        first = saved[0]
+        if len(saved) > 1:
+            first["also_saved"] = len(saved) - 1
+            first["files"] = [dict(e) for e in saved]
+        return first
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/scan")
+async def scan(x_upload_token: str | None = Header(default=None)) -> dict:
+    """Manual library refresh: ask Navidrome to rescan now."""
+    require_token(x_upload_token)
+    configured = bool(NAVIDROME_URL and NAVIDROME_USER and NAVIDROME_PASSWORD)
+    triggered = await trigger_scan() if configured else False
+    return {"scan_configured": configured, "scan_triggered": triggered}
+
+
+@app.get("/stats")
+async def stats(x_upload_token: str | None = Header(default=None)) -> dict:
+    """Library size right now + everything NaviUpload has ever added."""
+    require_token(x_upload_token)
+    out = read_stats()
+    out["library_files"] = library_file_count()
+    return out
+
+
+@app.post("/check")
+async def check(request: Request,
+                x_upload_token: str | None = Header(default=None)) -> dict:
+    """Duplicate check: for each {name, size}, is a file with that name
+    (or that exact size) already in the library?"""
+    require_token(x_upload_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Body must be JSON: {\"items\": [...]}")
+    items = (body or {}).get("items") or []
+    names, sizes = library_index()
+    results = []
+    for it in items[:200]:
+        name = str((it or {}).get("name") or "")
+        try:
+            size = int((it or {}).get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        results.append({
+            "name": name,
+            "exists": os.path.basename(name).lower() in names,
+            "same_size": bool(size) and size in sizes,
+        })
+    return {"results": results}
+
+
+@app.get("/in-library")
+async def in_library(title: str = "", artist: str = "",
+                     scan_first: int = 0,
+                     x_upload_token: str | None = Header(default=None)) -> dict:
+    """Has this track actually landed in Navidrome yet? Uses the
+    Subsonic search3 API when Navidrome credentials are configured."""
+    require_token(x_upload_token)
+    configured = bool(NAVIDROME_URL and NAVIDROME_USER and NAVIDROME_PASSWORD)
+    if not configured or not title:
+        return {"configured": configured, "found": False,
+                "matched_title": None}
+    if scan_first:
+        await trigger_scan()
+        await asyncio.sleep(3)
+    salt = secrets.token_hex(8)
+    token = hashlib.md5((NAVIDROME_PASSWORD + salt).encode()).hexdigest()
+    params = {
+        "u": NAVIDROME_USER, "t": token, "s": salt, "v": "1.16.1",
+        "c": "NavidromeUploader", "f": "json",
+        "query": f"{artist} {title}".strip(), "songCount": 10,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+            r = await client.get(f"{NAVIDROME_URL}/rest/search3.view",
+                                 params=params)
+        songs = (r.json().get("subsonic-response", {})
+                 .get("searchResult3", {}).get("song") or [])
+    except Exception:
+        return {"configured": True, "found": False, "matched_title": None}
+    for s in songs:
+        if _sim(title, s.get("title") or "") >= 0.8 and (
+                not artist or _sim(artist, s.get("artist") or "") >= 0.45):
+            return {"configured": True, "found": True,
+                    "matched_title": s.get("title")}
+    return {"configured": True, "found": False, "matched_title": None}
 
 
 @app.exception_handler(HTTPException)

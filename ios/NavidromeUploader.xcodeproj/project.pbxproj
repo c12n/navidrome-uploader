@@ -16,8 +16,26 @@
 		E00000000000000000000007 /* URLUploadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000007 /* URLUploadView.swift */; };
 		E00000000000000000000008 /* HistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000008 /* HistoryView.swift */; };
 		E00000000000000000000009 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000009 /* SettingsView.swift */; };
+		E00000000000000000000010 /* LibraryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000010 /* LibraryViews.swift */; };
+		E00000000000000000000011 /* SetupCodeViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000011 /* SetupCodeViews.swift */; };
+		E00000000000000000000012 /* BackgroundUploads.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000012 /* BackgroundUploads.swift */; };
+		F1000000000000000000000C /* ShareExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000000000000000000001 /* ShareExtension.swift */; };
+		F1000000000000000000000D /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000003 /* Models.swift */; };
+		F1000000000000000000000E /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000004 /* APIClient.swift */; };
+		F1000000000000000000000F /* Keychain.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000005 /* Keychain.swift */; };
+		F10000000000000000000010 /* ShareExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = F10000000000000000000003 /* ShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		E00000000000000000000090 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000090 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		F10000000000000000000013 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 111111111111111111111111 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F10000000000000000000005;
+			remoteInfo = ShareExtension;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		D00000000000000000000001 /* NavidromeUploaderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavidromeUploaderApp.swift; sourceTree = "<group>"; };
@@ -31,7 +49,13 @@
 		D00000000000000000000009 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		D00000000000000000000090 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		D00000000000000000000091 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		D00000000000000000000010 /* LibraryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryViews.swift; sourceTree = "<group>"; };
+		D00000000000000000000011 /* SetupCodeViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupCodeViews.swift; sourceTree = "<group>"; };
+		D00000000000000000000012 /* BackgroundUploads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundUploads.swift; sourceTree = "<group>"; };
+		F10000000000000000000001 /* ShareExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareExtension.swift; sourceTree = "<group>"; };
+		F10000000000000000000002 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		555555555555555555555555 /* NavidromeUploader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NavidromeUploader.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F10000000000000000000003 /* ShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = wrapper.app-extension; includeInIndex = 0; path = ShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -42,15 +66,46 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F10000000000000000000007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		F10000000000000000000011 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				F10000000000000000000010 /* ShareExtension.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXGroup section */
 		222222222222222222222222 = {
 			isa = PBXGroup;
 			children = (
 				333333333333333333333333 /* NavidromeUploader */,
+				F10000000000000000000004 /* ShareExtension */,
 				444444444444444444444444 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		F10000000000000000000004 /* ShareExtension */ = {
+			isa = PBXGroup;
+			children = (
+				F10000000000000000000001 /* ShareExtension.swift */,
+				F10000000000000000000002 /* Info.plist */,
+			);
+			path = ShareExtension;
 			sourceTree = "<group>";
 		};
 		333333333333333333333333 /* NavidromeUploader */ = {
@@ -65,6 +120,9 @@
 				D00000000000000000000007 /* URLUploadView.swift */,
 				D00000000000000000000008 /* HistoryView.swift */,
 				D00000000000000000000009 /* SettingsView.swift */,
+				D00000000000000000000010 /* LibraryViews.swift */,
+				D00000000000000000000011 /* SetupCodeViews.swift */,
+				D00000000000000000000012 /* BackgroundUploads.swift */,
 				D00000000000000000000090 /* Assets.xcassets */,
 				D00000000000000000000091 /* Info.plist */,
 			);
@@ -75,6 +133,7 @@
 			isa = PBXGroup;
 			children = (
 				555555555555555555555555 /* NavidromeUploader.app */,
+				F10000000000000000000003 /* ShareExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -89,17 +148,44 @@
 				AAAAAAAAAAAAAAAAAAAAAAAA /* Sources */,
 				BBBBBBBBBBBBBBBBBBBBBBBB /* Frameworks */,
 				CCCCCCCCCCCCCCCCCCCCCCCC /* Resources */,
+				F10000000000000000000011 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				F10000000000000000000012 /* PBXTargetDependency */,
 			);
 			name = NavidromeUploader;
 			productName = NavidromeUploader;
 			productReference = 555555555555555555555555 /* NavidromeUploader.app */;
 			productType = "com.apple.product-type.application";
 		};
+		F10000000000000000000005 /* ShareExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F10000000000000000000009 /* Build configuration list for PBXNativeTarget "ShareExtension" */;
+			buildPhases = (
+				F10000000000000000000006 /* Sources */,
+				F10000000000000000000007 /* Frameworks */,
+				F10000000000000000000008 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ShareExtension;
+			productName = ShareExtension;
+			productReference = F10000000000000000000003 /* ShareExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
+
+/* Begin PBXTargetDependency section */
+		F10000000000000000000012 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F10000000000000000000005 /* ShareExtension */;
+			targetProxy = F10000000000000000000013 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin PBXProject section */
 		111111111111111111111111 /* Project object */ = {
@@ -110,6 +196,9 @@
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
 					666666666666666666666666 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					F10000000000000000000005 = {
 						CreatedOnToolsVersion = 15.0;
 					};
 				};
@@ -128,6 +217,7 @@
 			projectRoot = "";
 			targets = (
 				666666666666666666666666 /* NavidromeUploader */,
+				F10000000000000000000005 /* ShareExtension */,
 			);
 		};
 /* End PBXProject section */
@@ -138,6 +228,13 @@
 			buildActionMask = 2147483647;
 			files = (
 				E00000000000000000000090 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F10000000000000000000008 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -157,6 +254,20 @@
 				E00000000000000000000007 /* URLUploadView.swift in Sources */,
 				E00000000000000000000008 /* HistoryView.swift in Sources */,
 				E00000000000000000000009 /* SettingsView.swift in Sources */,
+				E00000000000000000000010 /* LibraryViews.swift in Sources */,
+				E00000000000000000000011 /* SetupCodeViews.swift in Sources */,
+				E00000000000000000000012 /* BackgroundUploads.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F10000000000000000000006 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F1000000000000000000000C /* ShareExtension.swift in Sources */,
+				F1000000000000000000000D /* Models.swift in Sources */,
+				F1000000000000000000000E /* APIClient.swift in Sources */,
+				F1000000000000000000000F /* Keychain.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -188,14 +299,14 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = QD29U585ZA;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = NavidromeUploader/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.1;
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.c12n.navidromeuploader;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -214,20 +325,72 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = QD29U585ZA;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = NavidromeUploader/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.1;
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.c12n.navidromeuploader;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		F1000000000000000000000A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 5;
+				DEVELOPMENT_TEAM = QD29U585ZA;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 0.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.c12n.navidromeuploader.ShareExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		F1000000000000000000000B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 5;
+				DEVELOPMENT_TEAM = QD29U585ZA;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 0.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.c12n.navidromeuploader.ShareExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -250,6 +413,15 @@
 			buildConfigurations = (
 				999999999999999999999993 /* Debug */,
 				999999999999999999999994 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F10000000000000000000009 /* Build configuration list for PBXNativeTarget "ShareExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F1000000000000000000000A /* Debug */,
+				F1000000000000000000000B /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

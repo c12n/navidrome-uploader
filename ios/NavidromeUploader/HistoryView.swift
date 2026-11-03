@@ -10,6 +10,7 @@ import SwiftUI
 
 struct HistoryView: View {
     @Environment(HistoryStore.self) private var history
+    @Environment(SettingsStore.self) private var settings
 
     var body: some View {
         NavigationStack {
@@ -32,9 +33,21 @@ struct HistoryView: View {
                                           systemImage: item.source == .file ? "doc" : "link")
                                     Text("\u{00B7}")
                                     Text(item.date, format: .dateTime.month().day().hour().minute())
+                                    if item.fromServer {
+                                        Text("Server")
+                                            .font(.caption2.bold())
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 1)
+                                            .background(.thinMaterial, in: Capsule())
+                                    }
                                 }
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
+                                if !item.folder.isEmpty {
+                                    Text(item.folder)
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
                                 HStack(spacing: 8) {
                                     if item.size > 0 {
                                         Text(ByteCountFormatter.string(fromByteCount: Int64(item.size), countStyle: .file))
@@ -51,6 +64,13 @@ struct HistoryView: View {
                 }
             }
             .navigationTitle("History")
+            .task {
+                // Merge the server's own log so uploads made from the
+                // Windows app (or another device) show up here too.
+                if let entries = try? await settings.client.recentUploads() {
+                    history.mergeServer(entries)
+                }
+            }
             .toolbar {
                 if !history.items.isEmpty {
                     ToolbarItem(placement: .topBarTrailing) {

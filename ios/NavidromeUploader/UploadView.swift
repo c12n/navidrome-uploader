@@ -2,34 +2,54 @@
 //  UploadView.swift
 //  Navidrome Uploader
 //
-//  Tab 1: pick audio files — or a whole folder (e.g. an album) — from
-//  Files and upload them to the companion service one by one, with
-//  live send progress and a clear success / error summary.
+//  Tab 1: pick audio files — or a whole folder (an album) — and send
+//  them to the Navidrome library as a managed queue:
 //
-//  v1.0.1: multiple selection + folder selection. A picked folder is
-//  expanded recursively to the audio files inside it, in path order,
-//  so an album uploads in track order.
+//    * picked folders expand recursively, in track order
+//    * duplicates are checked against the library first (Settings)
+//      and skipped with a clear marker
+//    * the queue can be paused / resumed, and failed files retry
+//      (once automatically, then via "Retry failed")
+//    * file uploads run on a background URLSession, so they keep
+//      going when the phone locks; a notification lands when the
+//      queue finishes in the background
+//    * the library card up top shows live stats + a refresh button
 //
 
 import SwiftUI
 import UniformTypeIdentifiers
+import UserNotifications
+
+private struct QueueItem: Identifiable {
+    enum State: Equatable {
+        case pending, uploading, done, failed(String), skippedDuplicate
+    }
+
+    let id = UUID()
+    let url: URL
+    var size: Int = 0
+    var state: State = .pending
+    var progress: Double = 0
+    var attempts: Int = 0
+    var possibleDuplicate = false
+    var response: UploadResponse?
+
+    var name: String { url.lastPathComponent }
+}
 
 struct UploadView: View {
     @Environment(SettingsStore.self) private var settings
     @Environment(HistoryStore.self) private var history
 
     @State private var showImporter = false
-    @State private var isUploading = false
-    @State private var progress: Double = 0
-    @State private var statusLine: String?
-    @State private var summary: String?
-    @State private var detailLine: String?
-    @State private var summaryIsError = false
-    @State private var errorMessage: String?
+    @State private var queue: [QueueItem] = []
+    @State private var scopedRoots: [URL] = []
+    @State private var isRunning = false
+    @State private var isPaused = false
+    @State private var note: String?
+    @State private var noteIsError = false
+    @State private var cardReload = 0
 
-    /// Audio types the picker offers: the built-in audio UTTypes plus the
-    /// extensions from the spec that have no system constant. Folders are
-    /// included so a whole album folder can be picked at once.
     private var pickerTypes: [UTType] {
         var types: [UTType] = [.audio, .mp3, .mpeg4Audio, .wav, .aiff, .folder]
         for ext in ["flac", "ogg", "oga", "opus", "aac", "m4a"] {
@@ -42,75 +62,89 @@ struct UploadView: View {
         "mp3", "m4a", "flac", "wav", "ogg", "oga", "opus", "aac", "aif", "aiff",
     ]
 
+    private var pendingCount: Int { queue.filter { $0.state == .pending }.count }
+    private var failedItems: [QueueItem] { queue.filter {
+        if case .failed = $0.state { return true }
+        return false
+    } }
+    private var doneCount: Int { queue.filter { $0.state == .done }.count }
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
-                Spacer()
-
-                Image(systemName: "music.note.list")
-                    .font(.system(size: 56))
-                    .foregroundStyle(.tint)
-
-                Text("Send audio files \u{2014} or a whole album folder \u{2014} straight to your Navidrome library.")
-                    .font(.body)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal)
-
-                Button {
-                    showImporter = true
-                } label: {
-                    Label("Choose audio files or a folder", systemImage: "folder")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
+            List {
+                Section {
+                    LibraryCardView(reloadToken: cardReload)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Color.clear)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .padding(.horizontal)
-                .disabled(isUploading)
 
-                if isUploading {
-                    VStack(spacing: 8) {
-                        ProgressView(value: progress)
-                            .padding(.horizontal, 40)
-                        if let statusLine {
-                            Text(statusLine)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                                .lineLimit(2)
-                                .padding(.horizontal)
-                        }
+                Section {
+                    Button {
+                        showImporter = true
+                    } label: {
+                        Label(queue.isEmpty
+                              ? "Choose audio files or a folder"
+                              : "Add more files or a folder",
+                              systemImage: "folder")
+                            .font(.headline)
                     }
-                } else if let summary {
-                    VStack(spacing: 6) {
-                        Label(summary,
-                              systemImage: summaryIsError
+                    .disabled(isRunning)
+                } footer: {
+                    Text("A picked folder (for example an album) expands to every audio file inside it, in track order. Uploads keep going in the background if you lock the phone.")
+                }
+
+                if let note {
+                    Section {
+                        Label(note,
+                              systemImage: noteIsError
                                   ? "exclamationmark.triangle.fill"
                                   : "checkmark.circle.fill")
-                            .font(.headline)
-                            .foregroundStyle(summaryIsError ? .orange : .green)
-                            .multilineTextAlignment(.center)
-                        if let detailLine {
-                            Text(detailLine)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
+                            .font(.subheadline)
+                            .foregroundStyle(noteIsError ? .orange : .green)
+                    }
+                }
+
+                if !queue.isEmpty {
+                    Section {
+                        if isRunning {
+                            Button {
+                                isPaused.toggle()
+                            } label: {
+                                Label(isPaused ? "Resume" : "Pause",
+                                      systemImage: isPaused ? "play.fill" : "pause.fill")
+                            }
+                        } else if pendingCount > 0 {
+                            Button {
+                                runQueue()
+                            } label: {
+                                Label("Upload \(pendingCount) file\(pendingCount == 1 ? "" : "s")",
+                                      systemImage: "arrow.up.circle.fill")
+                                    .font(.headline)
+                            }
+                        }
+                        if !failedItems.isEmpty && !isRunning {
+                            Button {
+                                requeueFailed()
+                            } label: {
+                                Label("Retry \(failedItems.count) failed",
+                                      systemImage: "arrow.counterclockwise")
+                            }
+                        }
+                        if !isRunning {
+                            Button(role: .destructive) {
+                                clearQueue()
+                            } label: {
+                                Label("Clear list", systemImage: "trash")
+                            }
                         }
                     }
-                    .padding(.horizontal)
-                }
 
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
+                    Section("Files") {
+                        ForEach(queue) { item in
+                            queueRow(item)
+                        }
+                    }
                 }
-
-                Spacer()
             }
             .navigationTitle("Upload")
             .fileImporter(isPresented: $showImporter,
@@ -118,19 +152,91 @@ struct UploadView: View {
                           allowsMultipleSelection: true) { outcome in
                 switch outcome {
                 case .success(let urls):
-                    startQueue(urls)
+                    Task { await prepareQueue(picked: urls) }
                 case .failure(let error):
-                    errorMessage = error.localizedDescription
+                    note = error.localizedDescription
+                    noteIsError = true
                 }
+            }
+            .task {
+                // Ask once so a background-finished queue can notify.
+                UNUserNotificationCenter.current()
+                    .requestAuthorization(options: [.alert, .sound]) { _, _ in }
             }
         }
     }
 
-    // MARK: Selection expansion
+    // MARK: Rows
+
+    @ViewBuilder
+    private func queueRow(_ item: QueueItem) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(item.name)
+                    .font(.subheadline.bold())
+                    .lineLimit(1)
+                Spacer()
+                stateBadge(item)
+            }
+            switch item.state {
+            case .uploading:
+                ProgressView(value: item.progress)
+            case .failed(let message):
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+            case .done:
+                if let response = item.response {
+                    let notes = response.processingNotes
+                    Text(notes.isEmpty
+                         ? "In the library"
+                         : notes.joined(separator: " \u{00B7} "))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            case .skippedDuplicate:
+                Text("Already in your library \u{2014} skipped")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            case .pending:
+                if item.possibleDuplicate {
+                    Text("A file with this size is already in the library \u{2014} will upload anyway")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                } else if item.size > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(item.size), countStyle: .file))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func stateBadge(_ item: QueueItem) -> some View {
+        switch item.state {
+        case .pending:
+            Image(systemName: "clock").foregroundStyle(.secondary)
+        case .uploading:
+            Image(systemName: "arrow.up.circle").foregroundStyle(.tint)
+        case .done:
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .failed:
+            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+        case .skippedDuplicate:
+            Image(systemName: "equal.circle").foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Selection + duplicate check
 
     /// Expands picked URLs into a flat, path-ordered list of audio
-    /// files: folders are walked recursively, plain files are kept when
-    /// their extension is a supported audio type.
+    /// files: folders are walked recursively, plain files are kept
+    /// when their extension is a supported audio type.
     private func expand(_ urls: [URL]) -> [URL] {
         var files: [URL] = []
         let fm = FileManager.default
@@ -156,80 +262,172 @@ struct UploadView: View {
         }
     }
 
-    // MARK: Upload queue
-
-    private func startQueue(_ picked: [URL]) {
-        summary = nil
-        detailLine = nil
-        errorMessage = nil
-        summaryIsError = false
-
-        // Hold security scope on the picked items for the whole queue —
-        // files inside a picked folder are covered by the folder's scope.
-        let scoped = picked.filter { $0.startAccessingSecurityScopedResource() }
-
-        let files = expand(picked)
-        guard !files.isEmpty else {
-            scoped.forEach { $0.stopAccessingSecurityScopedResource() }
-            errorMessage = "No audio files in that selection. Pick audio files, or a folder that contains them."
+    private func prepareQueue(picked: [URL]) async {
+        note = nil
+        noteIsError = false
+        // Hold security scope on the picked roots for as long as the
+        // queue exists (files inside a folder are covered by its scope).
+        let alreadyQueued = Set(queue.map { $0.url })
+        for root in picked where !scopedRoots.contains(root) {
+            if root.startAccessingSecurityScopedResource() {
+                scopedRoots.append(root)
+            }
+        }
+        var added = 0
+        for file in expand(picked) where !alreadyQueued.contains(file) {
+            var item = QueueItem(url: file)
+            item.size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?
+                .fileSize ?? 0
+            queue.append(item)
+            added += 1
+        }
+        guard added > 0 else {
+            note = "No new audio files in that selection."
+            noteIsError = true
             return
         }
 
-        isUploading = true
-        progress = 0
-        let client = settings.client
-        Task {
-            defer {
-                scoped.forEach { $0.stopAccessingSecurityScopedResource() }
-                isUploading = false
-                statusLine = nil
-            }
-            var okCount = 0
-            var okBytes = 0
-            var lastResponse: UploadResponse?
-            var failures: [(name: String, message: String)] = []
-
-            for (index, file) in files.enumerated() {
-                statusLine = files.count > 1
-                    ? "File \(index + 1) of \(files.count) \u{00B7} \(file.lastPathComponent)"
-                    : "Uploading \(file.lastPathComponent)"
-                progress = 0
-                do {
-                    let response = try await client.uploadFile(fileURL: file) { fraction in
-                        progress = fraction
+        // Duplicate check against the server's library, when enabled.
+        if settings.skipDuplicates,
+           !settings.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let pending = queue.filter { $0.state == .pending }
+            if !pending.isEmpty,
+               let results = try? await settings.client.checkDuplicates(
+                   items: pending.map { (name: $0.name, size: $0.size) }),
+               results.count == pending.count {
+                for (item, result) in zip(pending, results) {
+                    guard let index = queue.firstIndex(where: { $0.id == item.id })
+                    else { continue }
+                    if result.exists {
+                        queue[index].state = .skippedDuplicate
+                    } else if result.sameSize {
+                        queue[index].possibleDuplicate = true
                     }
-                    okCount += 1
-                    okBytes += response.size
-                    lastResponse = response
-                    history.add(name: file.lastPathComponent, source: .file, response: response)
-                } catch {
-                    failures.append((
-                        name: file.lastPathComponent,
-                        message: (error as? LocalizedError)?.errorDescription
-                            ?? error.localizedDescription))
                 }
-            }
-
-            if failures.isEmpty {
-                summaryIsError = false
-                if files.count == 1, let response = lastResponse {
-                    summary = "Uploaded"
-                    detailLine = "\(response.savedAs)\n\(ByteCountFormatter.string(fromByteCount: Int64(response.size), countStyle: .file)) \u{00B7} \(response.scanTriggered ? "Library scan triggered" : "Saved \u{2014} scan not triggered")"
-                } else {
-                    summary = "Uploaded \(okCount) files"
-                    detailLine = ByteCountFormatter.string(fromByteCount: Int64(okBytes), countStyle: .file)
-                        + " \u{00B7} in your library now"
-                }
-            } else if okCount > 0 {
-                summaryIsError = true
-                summary = "Uploaded \(okCount) of \(files.count) \u{2014} \(failures.count) failed"
-                detailLine = failures.first.map { "\($0.name): \($0.message)" }
-            } else {
-                summary = nil
-                errorMessage = failures.first.map {
-                    files.count > 1 ? "\($0.name): \($0.message)" : $0.message
-                } ?? "Upload failed."
             }
         }
+
+        let skipped = queue.filter { $0.state == .skippedDuplicate }.count
+        if skipped > 0 {
+            note = "\(skipped) file\(skipped == 1 ? " is" : "s are") already in your library and will be skipped."
+            noteIsError = false
+        }
+    }
+
+    // MARK: Running the queue
+
+    private func requeueFailed() {
+        for index in queue.indices {
+            if case .failed = queue[index].state {
+                queue[index].state = .pending
+                queue[index].attempts = 0
+                queue[index].progress = 0
+            }
+        }
+        runQueue()
+    }
+
+    private func clearQueue() {
+        queue.removeAll()
+        scopedRoots.forEach { $0.stopAccessingSecurityScopedResource() }
+        scopedRoots.removeAll()
+        note = nil
+    }
+
+    private func runQueue() {
+        guard !isRunning else { return }
+        isRunning = true
+        isPaused = false
+        note = nil
+        let client = settings.client
+        let enrich = settings.enrichFiles
+        let lyrics = settings.embedLyrics
+        let sort = settings.sortFolders
+
+        Task { @MainActor in
+            // Two passes: the second pass retries fresh failures once.
+            for pass in 0...1 {
+                var index = 0
+                while index < queue.count {
+                    while isPaused {
+                        try? await Task.sleep(for: .milliseconds(300))
+                    }
+                    if queue[index].state == .pending {
+                        queue[index].state = .uploading
+                        queue[index].progress = 0
+                        queue[index].attempts += 1
+                        let itemID = queue[index].id
+                        let fileURL = queue[index].url
+                        do {
+                            let response = try await client.uploadFile(
+                                fileURL: fileURL,
+                                enrich: enrich, lyrics: lyrics, sort: sort
+                            ) { fraction in
+                                if let i = queue.firstIndex(where: { $0.id == itemID }) {
+                                    queue[i].progress = fraction
+                                }
+                            }
+                            if let i = queue.firstIndex(where: { $0.id == itemID }) {
+                                queue[i].state = .done
+                                queue[i].response = response
+                            }
+                            history.add(name: fileURL.lastPathComponent,
+                                        source: .file, response: response)
+                        } catch {
+                            if let i = queue.firstIndex(where: { $0.id == itemID }) {
+                                queue[i].state = .failed(
+                                    (error as? LocalizedError)?.errorDescription
+                                        ?? error.localizedDescription)
+                            }
+                        }
+                    }
+                    index += 1
+                }
+                // Second pass only if something failed on the first.
+                if pass == 0 {
+                    var retried = false
+                    for i in queue.indices {
+                        if case .failed = queue[i].state, queue[i].attempts < 2 {
+                            queue[i].state = .pending
+                            retried = true
+                        }
+                    }
+                    if !retried { break }
+                }
+            }
+
+            isRunning = false
+            cardReload += 1
+            let done = doneCount
+            let failed = failedItems.count
+            if failed == 0, done > 0 {
+                note = "Uploaded \(done) file\(done == 1 ? "" : "s") to your library."
+                noteIsError = false
+            } else if done > 0 {
+                note = "Uploaded \(done) \u{2014} \(failed) failed. Use Retry to try them again."
+                noteIsError = true
+            } else if failed > 0 {
+                note = "\(failed) upload\(failed == 1 ? "" : "s") failed."
+                noteIsError = true
+            }
+            if done > 0 {
+                notifyIfBackgrounded(
+                    title: "NaviUpload finished",
+                    body: failed == 0
+                        ? "\(done) song\(done == 1 ? "" : "s") added to your Navidrome library."
+                        : "\(done) added, \(failed) failed.")
+            }
+        }
+    }
+
+    private func notifyIfBackgrounded(title: String, body: String) {
+        guard UIApplication.shared.applicationState != .active else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString,
+                                  content: content, trigger: nil))
     }
 }

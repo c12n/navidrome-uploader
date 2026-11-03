@@ -10,6 +10,11 @@ import SwiftUI
 
 @main
 struct NavidromeUploaderApp: App {
+    // The delegate exists mainly for background-upload sessions:
+    // it registers the background uploader with APIClient at launch
+    // and receives the system's background-event completion handler.
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     @State private var settings = SettingsStore()
     @State private var history = HistoryStore()
 
