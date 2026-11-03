@@ -4,7 +4,12 @@
 # Deploy layout on the box:
 #   /media/ZimaOS-HD/AppData/navidrome-uploader/app/           <- app/main.py + requirements.txt
 #   /media/ZimaOS-HD/AppData/navidrome-uploader/data/          <- uploads.jsonl log
-#   /media/ZimaOS-HD/Media/Music/Music/                        <- Navidrome library (mounted at /music)
+#   /media/SSD-Storage/Media/Music/Music/                      <- Navidrome library (mounted at /music)
+# NOTE: the scanned library is on the 512GB NVMe (SSD-Storage). The
+# near-identical copy under /media/ZimaOS-HD/Media/Music/Music (256GB
+# SSD) is NOT what Navidrome scans — proven 2026-11-03 from the
+# Navidrome DB (NVMe-only file present & not missing; SSD-only album
+# absent from the DB entirely).
 # Replace __UPLOAD_TOKEN__, __NAVIDROME_USER__, __NAVIDROME_PASSWORD__
 # in the deploy copy (never commit the real values).
 services:
@@ -18,7 +23,7 @@ services:
     volumes:
       - /media/ZimaOS-HD/AppData/navidrome-uploader/app:/app
       - /media/ZimaOS-HD/AppData/navidrome-uploader/data:/data
-      - /media/ZimaOS-HD/Media/Music/Music:/music
+      - /media/SSD-Storage/Media/Music/Music:/music
     environment:
       UPLOAD_TOKEN: "__UPLOAD_TOKEN__"
       LIBRARY_DIR: "/music"
