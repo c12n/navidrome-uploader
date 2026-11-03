@@ -1119,9 +1119,11 @@ class _UrlPageState extends State<UrlPage> {
         const _SectionHeader('Add from a URL'),
         Text(
           'Paste a link and the server downloads it into your library. '
-          'A direct audio link is saved as-is; a page link — YouTube, '
-          'SoundCloud and similar — is fetched on the server with '
-          'yt-dlp and converted to audio there.',
+          'A direct audio link is saved as-is. Links on supported '
+          'file hosters are fetched through your TorBox or Premiumize '
+          'account when the server has a key for one. Any other page '
+          'link — YouTube, SoundCloud and similar — is fetched on the '
+          'server with yt-dlp and converted to audio there.',
           style: theme.textTheme.bodyLarge
               ?.copyWith(color: scheme.onSurfaceVariant),
         ),

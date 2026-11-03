@@ -60,7 +60,7 @@ struct URLUploadView: View {
                 }
 
                 Section {
-                    Text("Direct audio links (mp3, m4a, flac, wav, ogg, opus, aac) are fetched as-is. YouTube and other page links are handled on the server with yt-dlp.")
+                    Text("Direct audio links (mp3, m4a, flac, wav, ogg, opus, aac) are fetched as-is. Links on supported file hosters are fetched through your TorBox or Premiumize account when the server has a key for one. YouTube and other page links are handled on the server with yt-dlp.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
