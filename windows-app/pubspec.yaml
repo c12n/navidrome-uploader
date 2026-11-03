@@ -1,0 +1,23 @@
+name: naviupload_windows
+description: "NaviUpload for Windows — upload music directly to your Navidrome library from files or URLs, with the same big-type Material 3 look as Viu for Windows."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.2
+  shared_preferences: ^2.3.2
+  flutter_secure_storage: ^9.2.2
+  file_picker: ^8.0.0
+  desktop_drop: ^0.4.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

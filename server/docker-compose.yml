@@ -31,6 +31,8 @@ services:
       NAVIDROME_URL: "http://host.docker.internal:4533"
       NAVIDROME_USER: "__NAVIDROME_USER__"
       NAVIDROME_PASSWORD: "__NAVIDROME_PASSWORD__"
+      TORBOX_API_KEY: "__TORBOX_API_KEY__"
+      PREMIUMIZE_API_KEY: "__PREMIUMIZE_API_KEY__"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
