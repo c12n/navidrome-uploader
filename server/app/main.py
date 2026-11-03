@@ -251,8 +251,8 @@ async def torbox_hoster_domains() -> set:
     return _hosters_cache["domains"]
 
 
-async def torbox_matches(url: str) -> bool:
-    if not TORBOX_API_KEY:
+async def torbox_matches(url: str, key: str) -> bool:
+    if not key:
         return False
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     if not host:
@@ -291,9 +291,10 @@ async def _download_to_file(url: str, dest: str) -> None:
                     out.write(chunk)
 
 
-async def fetch_with_torbox(url: str, workdir: str) -> list:
+async def fetch_with_torbox(url: str, workdir: str, key: str = "") -> list:
     """Returns [(local_path, filename), ...] for audio (ZIPs unpacked)."""
-    headers = {"Authorization": f"Bearer {TORBOX_API_KEY}"}
+    key = key or TORBOX_API_KEY
+    headers = {"Authorization": f"Bearer {key}"}
     async with httpx.AsyncClient(timeout=60, trust_env=False) as client:
         r = await client.post(f"{TORBOX_API_BASE}/webdl/createwebdownload",
                               headers=headers, json={"link": url})
@@ -339,7 +340,7 @@ async def fetch_with_torbox(url: str, workdir: str) -> list:
                 continue
             r = await client.get(
                 f"{TORBOX_API_BASE}/webdl/requestdl",
-                params={"token": TORBOX_API_KEY, "web_id": web_id,
+                params={"token": key, "web_id": web_id,
                         "file_id": f.get("id")})
             dl = r.json().get("data")
             if not isinstance(dl, str) or not dl.startswith("http"):
@@ -362,7 +363,7 @@ async def fetch_with_torbox(url: str, workdir: str) -> list:
 _pm_hosters_cache: dict = {"at": 0.0, "domains": set(), "known": False}
 
 
-async def premiumize_hoster_domains() -> set:
+async def premiumize_hoster_domains(key: str) -> set:
     now = time.time()
     if _pm_hosters_cache["known"] and now - _pm_hosters_cache["at"] < 3600:
         return _pm_hosters_cache["domains"]
@@ -370,7 +371,7 @@ async def premiumize_hoster_domains() -> set:
         async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
             r = await client.get(
                 f"{PREMIUMIZE_API_BASE}/services/list",
-                headers={"Authorization": f"Bearer {PREMIUMIZE_API_KEY}"})
+                headers={"Authorization": f"Bearer {key}"})
         payload = r.json()
         domains = set()
         hosterlist = payload.get("hosterlist") or payload.get("hosters") or {}
@@ -393,21 +394,21 @@ async def premiumize_hoster_domains() -> set:
     return _pm_hosters_cache["domains"]
 
 
-async def premiumize_matches(url: str) -> bool:
-    if not PREMIUMIZE_API_KEY:
+async def premiumize_matches(url: str, key: str) -> bool:
+    if not key:
         return False
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     if not host:
         return False
-    domains = await premiumize_hoster_domains()
+    domains = await premiumize_hoster_domains(key)
     if not domains:
         return False  # list unavailable: don't guess, other routes decide
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
-async def _pm_post(client: httpx.AsyncClient, path: str, data: dict) -> dict:
+async def _pm_post(client: httpx.AsyncClient, path: str, data: dict, key: str) -> dict:
     r = await client.post(f"{PREMIUMIZE_API_BASE}{path}",
-                          headers={"Authorization": f"Bearer {PREMIUMIZE_API_KEY}"},
+                          headers={"Authorization": f"Bearer {key}"},
                           data=data)
     try:
         return r.json()
@@ -415,13 +416,14 @@ async def _pm_post(client: httpx.AsyncClient, path: str, data: dict) -> dict:
         return {}
 
 
-async def fetch_with_premiumize(url: str, workdir: str) -> list:
+async def fetch_with_premiumize(url: str, workdir: str, key: str = "") -> list:
     """Returns [(local_path, filename), ...] for audio (ZIPs unpacked)."""
+    key = key or PREMIUMIZE_API_KEY
     async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
-        payload = await _pm_post(client, "/transfer/directdl", {"src": url})
+        payload = await _pm_post(client, "/transfer/directdl", {"src": url}, key)
         content = payload.get("content") or []
         if payload.get("status") != "success" or not content:
-            created = await _pm_post(client, "/transfer/create", {"src": url})
+            created = await _pm_post(client, "/transfer/create", {"src": url}, key)
             transfer_id = (created.get("id")
                            if created.get("status") == "success" else None)
             if transfer_id is None:
@@ -431,7 +433,7 @@ async def fetch_with_premiumize(url: str, workdir: str) -> list:
             deadline = time.time() + 8 * 60
             finished = False
             while time.time() < deadline:
-                listing = await _pm_post(client, "/transfer/list", {})
+                listing = await _pm_post(client, "/transfer/list", {}, key)
                 for item in listing.get("transfers") or []:
                     if str(item.get("id")) == str(transfer_id):
                         status = str(item.get("status") or "").lower()
@@ -447,7 +449,7 @@ async def fetch_with_premiumize(url: str, workdir: str) -> list:
                 await asyncio.sleep(5)
             if not finished:
                 raise HTTPException(504, "Premiumize did not finish in time")
-            payload = await _pm_post(client, "/transfer/directdl", {"src": url})
+            payload = await _pm_post(client, "/transfer/directdl", {"src": url}, key)
             content = payload.get("content") or []
             if payload.get("status") != "success" or not content:
                 raise HTTPException(502, "Premiumize finished but returned no files")
@@ -490,6 +492,8 @@ def fetch_with_ytdlp(url: str, workdir: str) -> str:
 async def upload_url(
     request: Request,
     x_upload_token: str | None = Header(default=None),
+    x_torbox_key: str | None = Header(default=None),
+    x_premiumize_key: str | None = Header(default=None),
 ) -> dict:
     require_token(x_upload_token)
     try:
@@ -510,18 +514,22 @@ async def upload_url(
             return await finish_save(tmp, direct_name, "url")
 
         # Debrid routes first when the link is on a provider's hoster
-        # list and that provider's key is configured: TorBox, then
-        # Premiumize. A provider failure never blocks the next route.
+        # list and that provider's key is available: TorBox, then
+        # Premiumize. Keys come from the app per request (X-TorBox-Key /
+        # X-Premiumize-Key headers) when present, else the server's own
+        # environment. A provider failure never blocks the next route.
+        tb_key = (x_torbox_key or "").strip() or TORBOX_API_KEY
+        pm_key = (x_premiumize_key or "").strip() or PREMIUMIZE_API_KEY
         provider_error = None
-        for matches, fetch, label in (
-            (torbox_matches, fetch_with_torbox, "torbox"),
-            (premiumize_matches, fetch_with_premiumize, "premiumize"),
+        for key, matches, fetch, label in (
+            (tb_key, torbox_matches, fetch_with_torbox, "torbox"),
+            (pm_key, premiumize_matches, fetch_with_premiumize, "premiumize"),
         ):
-            if not await matches(url):
+            if not await matches(url, key):
                 continue
             try:
                 saved = []
-                for local, fname in await fetch(url, workdir):
+                for local, fname in await fetch(url, workdir, key):
                     saved.append(await finish_save(local, fname, "url"))
                 first = saved[0]
                 first["via"] = label

@@ -79,4 +79,32 @@ struct Keychain {
             }
         }
     }
+
+    // MARK: Debrid API keys (optional, entered in Settings)
+
+    private let torboxAccount = "torbox_api_key"
+
+    var torboxKey: String? {
+        get { get(account: torboxAccount) }
+        nonmutating set {
+            if let newValue, !newValue.isEmpty {
+                set(newValue, account: torboxAccount)
+            } else {
+                delete(account: torboxAccount)
+            }
+        }
+    }
+
+    private let premiumizeAccount = "premiumize_api_key"
+
+    var premiumizeKey: String? {
+        get { get(account: premiumizeAccount) }
+        nonmutating set {
+            if let newValue, !newValue.isEmpty {
+                set(newValue, account: premiumizeAccount)
+            } else {
+                delete(account: premiumizeAccount)
+            }
+        }
+    }
 }

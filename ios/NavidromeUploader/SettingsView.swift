@@ -40,6 +40,25 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    LabeledContent("TorBox") {
+                        SecureField("API key", text: $settings.torboxKey)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .multilineTextAlignment(.trailing)
+                    }
+                    LabeledContent("Premiumize") {
+                        SecureField("API key", text: $settings.premiumizeKey)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .multilineTextAlignment(.trailing)
+                    }
+                } header: {
+                    Text("Debrid services")
+                } footer: {
+                    Text(debridStateText)
+                }
+
+                Section {
                     Button {
                         testConnection()
                     } label: {
@@ -83,6 +102,17 @@ struct SettingsView: View {
             return "No token saved yet \u{2014} uploads will fail until you paste the server\u{2019}s UPLOAD_TOKEN here (32 characters, letters a\u{2013}f and digits, no dashes)."
         }
         return "Token saved (\(token.count) characters), stored in the Keychain and sent as the X-Upload-Token header. It must match the server\u{2019}s UPLOAD_TOKEN exactly."
+    }
+
+    /// Saved-state line for the Debrid section, lengths only.
+    private var debridStateText: String {
+        let tb = settings.torboxKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pm = settings.premiumizeKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        var parts: [String] = []
+        if !tb.isEmpty { parts.append("TorBox key saved (\(tb.count) characters)") }
+        if !pm.isEmpty { parts.append("Premiumize key saved (\(pm.count) characters)") }
+        let state = parts.isEmpty ? "No keys saved." : parts.joined(separator: " \u{00B7} ")
+        return "\(state) Optional: with a key saved, links on that service\u{2019}s supported hosters are fetched through your account. Keys live in the Keychain and are sent only to your own server, with URL downloads."
     }
 
     private static var versionString: String {

@@ -158,6 +158,12 @@ class AppState extends ChangeNotifier {
   String serverUrl = 'https://upload.07051969.xyz';
   String? token;
 
+  // Optional per-user debrid keys, sent to the server with URL
+  // downloads (X-TorBox-Key / X-Premiumize-Key). Blank means "use
+  // whatever keys the server itself has configured".
+  String? torboxKey;
+  String? premiumizeKey;
+
   int accentIndex = 0;
   int appearanceMode = 2; // 0 system, 1 light, 2 dark (default dark)
 
@@ -189,6 +195,8 @@ class AppState extends ChangeNotifier {
     accentIndex = prefs.getInt('naviupload_accent') ?? 0;
     appearanceMode = prefs.getInt('naviupload_appearance') ?? 2;
     token = await _secure.read(key: 'upload_token');
+    torboxKey = await _secure.read(key: 'torbox_api_key');
+    premiumizeKey = await _secure.read(key: 'premiumize_api_key');
     final raw = prefs.getString('naviupload_history');
     if (raw != null) {
       try {
@@ -229,6 +237,28 @@ class AppState extends ChangeNotifier {
       await _secure.delete(key: 'upload_token');
     } else {
       await _secure.write(key: 'upload_token', value: v);
+    }
+  }
+
+  Future<void> setTorboxKey(String value) async {
+    final v = value.trim();
+    torboxKey = v.isEmpty ? null : v;
+    notifyListeners();
+    if (v.isEmpty) {
+      await _secure.delete(key: 'torbox_api_key');
+    } else {
+      await _secure.write(key: 'torbox_api_key', value: v);
+    }
+  }
+
+  Future<void> setPremiumizeKey(String value) async {
+    final v = value.trim();
+    premiumizeKey = v.isEmpty ? null : v;
+    notifyListeners();
+    if (v.isEmpty) {
+      await _secure.delete(key: 'premiumize_api_key');
+    } else {
+      await _secure.write(key: 'premiumize_api_key', value: v);
     }
   }
 
@@ -318,6 +348,17 @@ class NaviApi {
     final t = appState.token;
     if (t == null || t.isEmpty) return const {};
     return {'X-Upload-Token': t};
+  }
+
+  /// The user's own debrid keys, when saved in Settings. The server
+  /// prefers these over its configured keys; absent means server keys.
+  Map<String, String> get _debridHeaders {
+    final headers = <String, String>{};
+    final tb = appState.torboxKey;
+    if (tb != null && tb.isNotEmpty) headers['X-TorBox-Key'] = tb;
+    final pm = appState.premiumizeKey;
+    if (pm != null && pm.isNotEmpty) headers['X-Premiumize-Key'] = pm;
+    return headers;
   }
 
   /// Pull the server's own error message out of a response body.
@@ -472,6 +513,7 @@ class NaviApi {
         headers: {
           'Content-Type': 'application/json',
           ..._authHeaders,
+          ..._debridHeaders,
         },
         body: jsonEncode({'url': url}),
       );
@@ -1353,6 +1395,8 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _urlCtrl = TextEditingController();
   final TextEditingController _tokenCtrl = TextEditingController();
+  final TextEditingController _torboxCtrl = TextEditingController();
+  final TextEditingController _premiumizeCtrl = TextEditingController();
   bool _synced = false;
 
   @override
@@ -1372,6 +1416,8 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() {
       _urlCtrl.text = appState.serverUrl;
       _tokenCtrl.text = appState.token ?? '';
+      _torboxCtrl.text = appState.torboxKey ?? '';
+      _premiumizeCtrl.text = appState.premiumizeKey ?? '';
     });
   }
 
@@ -1379,12 +1425,29 @@ class _SettingsPageState extends State<SettingsPage> {
   void dispose() {
     _urlCtrl.dispose();
     _tokenCtrl.dispose();
+    _torboxCtrl.dispose();
+    _premiumizeCtrl.dispose();
     super.dispose();
   }
 
   void _snack(String text) {
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// "Saved (N characters)" note under a debrid key field, or nothing
+  /// when no key is stored.
+  Widget _savedLine(BuildContext context, String? key) {
+    if (key == null || key.isEmpty) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Text(
+        'Saved (${key.length} characters)',
+        style: theme.textTheme.bodyMedium
+            ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+      ),
+    );
   }
 
   Widget _connectionResult(BuildContext context) {
@@ -1488,6 +1551,62 @@ class _SettingsPageState extends State<SettingsPage> {
               if (mounted) _snack('Token saved on this computer.');
             },
             child: const Text('Save token'),
+          ),
+        ),
+        const _SectionHeader('Debrid services (optional)'),
+        Text(
+          'Keys are stored in Windows secure storage and sent to your '
+          'NaviUpload server with URL downloads. Leave a key blank to '
+          'use the key configured on the server itself.',
+          style: theme.textTheme.bodyMedium
+              ?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _torboxCtrl,
+          style: theme.textTheme.bodyLarge,
+          obscureText: true,
+          decoration: const InputDecoration(
+            labelText: 'TorBox API key',
+            hintText: 'From torbox.app — Settings, API',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        _savedLine(context, appState.torboxKey),
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: FilledButton.tonal(
+            onPressed: () async {
+              await appState.setTorboxKey(_torboxCtrl.text);
+              if (mounted) _snack('TorBox key saved on this computer.');
+            },
+            child: const Text('Save TorBox key'),
+          ),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _premiumizeCtrl,
+          style: theme.textTheme.bodyLarge,
+          obscureText: true,
+          decoration: const InputDecoration(
+            labelText: 'Premiumize API key',
+            hintText: 'From premiumize.me — Account, API key',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        _savedLine(context, appState.premiumizeKey),
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: FilledButton.tonal(
+            onPressed: () async {
+              await appState.setPremiumizeKey(_premiumizeCtrl.text);
+              if (mounted) {
+                _snack('Premiumize key saved on this computer.');
+              }
+            },
+            child: const Text('Save Premiumize key'),
           ),
         ),
         const _SectionHeader('Connection'),

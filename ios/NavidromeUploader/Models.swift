@@ -90,10 +90,28 @@ final class SettingsStore {
         }
     }
 
+    /// Optional TorBox API key (Settings). Keychain-backed like the
+    /// token; sent to the server as X-TorBox-Key on /url requests.
+    var torboxKey: String {
+        didSet {
+            Keychain.shared.torboxKey = torboxKey.isEmpty ? nil : torboxKey
+        }
+    }
+
+    /// Optional Premiumize API key (Settings). Sent as
+    /// X-Premiumize-Key on /url requests.
+    var premiumizeKey: String {
+        didSet {
+            Keychain.shared.premiumizeKey = premiumizeKey.isEmpty ? nil : premiumizeKey
+        }
+    }
+
     init() {
         baseURLString = UserDefaults.standard.string(forKey: Self.baseURLKey)
             ?? Self.defaultBaseURL
         token = Keychain.shared.uploadToken ?? ""
+        torboxKey = Keychain.shared.torboxKey ?? ""
+        premiumizeKey = Keychain.shared.premiumizeKey ?? ""
     }
 
     /// The base URL with any trailing slash removed, if it parses.
@@ -110,7 +128,9 @@ final class SettingsStore {
     /// stray space or newline, which the server rightly rejects.
     var client: APIClient {
         APIClient(baseURLString: baseURLString,
-                  token: token.trimmingCharacters(in: .whitespacesAndNewlines))
+                  token: token.trimmingCharacters(in: .whitespacesAndNewlines),
+                  torboxKey: torboxKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                  premiumizeKey: premiumizeKey.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
 

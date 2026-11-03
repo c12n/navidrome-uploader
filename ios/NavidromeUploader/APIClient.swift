@@ -53,6 +53,8 @@ enum APIError: Error, LocalizedError {
 struct APIClient {
     let baseURLString: String
     let token: String
+    var torboxKey: String = ""
+    var premiumizeKey: String = ""
 
     private var baseURL: URL? {
         let trimmed = baseURLString
@@ -120,6 +122,14 @@ struct APIClient {
         var req = try request(for: "url")
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Optional debrid keys from Settings: the server uses these for
+        // this request when present, else its own configured keys.
+        if !torboxKey.isEmpty {
+            req.setValue(torboxKey, forHTTPHeaderField: "X-TorBox-Key")
+        }
+        if !premiumizeKey.isEmpty {
+            req.setValue(premiumizeKey, forHTTPHeaderField: "X-Premiumize-Key")
+        }
         req.httpBody = try JSONSerialization.data(withJSONObject: ["url": urlString])
         let (data, response) = try await URLSession.shared.data(for: req)
         return try decode(UploadResponse.self, data: data, response: response)

@@ -1,7 +1,7 @@
 name: naviupload_windows
 description: "NaviUpload for Windows — upload music directly to your Navidrome library from files or URLs, with the same big-type Material 3 look as Viu for Windows."
 publish_to: 'none'
-version: 0.1.1+3
+version: 0.1.1+4
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
