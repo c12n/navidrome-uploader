@@ -13,6 +13,12 @@ service is the missing front door. It runs on the same box as Navidrome
                        fetched through the user's TorBox account when
                        TORBOX_API_KEY is configured (ZIPs are unpacked,
                        every audio file inside is saved)
+                     * a Google Drive file link is fetched through
+                       Drive's direct-download endpoint
+                     * a Spotify track / album / playlist link resolves
+                       through Spotify's public embed pages (no account)
+                       and every track is fetched with yt-dlp search,
+                       tagged with the exact Spotify metadata
                      * any other page/media link (YouTube etc.) is fetched
                        with yt-dlp and extracted to MP3 (needs ffmpeg,
                        installed by the container start command)
@@ -73,6 +79,11 @@ TORBOX_API_BASE = os.environ.get(
 PREMIUMIZE_API_KEY = os.environ.get("PREMIUMIZE_API_KEY", "")
 PREMIUMIZE_API_BASE = os.environ.get(
     "PREMIUMIZE_API_BASE", "https://www.premiumize.me/api").rstrip("/")
+SPOTIFY_EMBED_BASE = os.environ.get(
+    "SPOTIFY_EMBED_BASE", "https://open.spotify.com").rstrip("/")
+DRIVE_DOWNLOAD_BASE = os.environ.get(
+    "DRIVE_DOWNLOAD_BASE",
+    "https://drive.usercontent.google.com").rstrip("/")
 
 app = FastAPI(title="Navidrome Uploader", version="1.0.0")
 
@@ -99,6 +110,25 @@ def sanitize_filename(name: str) -> str:
     stem = stem[:120].strip() or "upload"
     ext = ("." + ext.lower()) if dot else ""
     return stem + ext
+
+
+def _clean_error(text: str, fallback: str = "unknown error") -> str:
+    """Turn a tool's stderr into one short, human line for the app.
+    yt-dlp sometimes echoes a whole HTML error page (Google Drive's,
+    notably); the app must never be shown page source. Prefer the
+    last ERROR line, strip any markup, cap the length."""
+    lines = []
+    for raw in (text or "").splitlines():
+        line = re.sub(r"<[^>]+>", " ", raw)
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    if not lines:
+        return fallback
+    for line in reversed(lines):
+        if "ERROR" in line:
+            return line[:240]
+    return lines[-1][:240]
 
 
 def unique_path(filename: str, subdir: str = "") -> str:
@@ -543,11 +573,15 @@ async def _fetch_lyrics(title: str, artist: str,
 
 
 async def enrich_file(path: str, want_meta: bool, want_lyrics: bool,
-                      display_name: str = "") -> dict:
+                      display_name: str = "", known: dict | None = None
+                      ) -> dict:
     """Identify the track, then embed proper tags, cover art and
     lyrics into the file. Best-effort: failures leave the file as-is.
     display_name is the name the user knows the file by (uploads sit in
-    a random temp file on disk, so their own stem is meaningless)."""
+    a random temp file on disk, so their own stem is meaningless).
+    known carries authoritative metadata (Spotify links): it wins for
+    the identification query, and if no source identifies the track the
+    known values are written as the tags directly."""
     report = {"matched": False, "source": None,
               "lyrics_embedded": False, "title": None}
     if not _HAS_MUTAGEN or (not want_meta and not want_lyrics):
@@ -557,11 +591,22 @@ async def enrich_file(path: str, want_meta: bool, want_lyrics: bool,
     f_artist, f_title = split_artist_title(stem)
     title = clean_title(tags["title"]) or f_title
     artist = tags["artist"] or f_artist
+    if known:
+        title = known.get("title") or title
+        artist = known.get("artist") or artist
     meta, cover = None, None
     if want_meta:
         meta = await _identify_itunes(title, artist)
         if meta is None:
             meta = await _identify_musicbrainz(title, artist)
+        if meta is None and known:
+            meta = {"title": known.get("title") or title,
+                    "artist": known.get("artist") or artist,
+                    "album": known.get("album") or "",
+                    "year": known.get("year") or "",
+                    "track": known.get("track"),
+                    "cover_url": known.get("cover_url"),
+                    "source": "spotify"}
         if meta:
             report["matched"] = True
             report["source"] = meta["source"]
@@ -650,12 +695,13 @@ def _sort_subdir(path: str) -> str:
 
 async def save_processed(local: str, fname: str, source: str,
                          want_meta: bool, want_lyrics: bool,
-                         sort: bool) -> dict:
+                         sort: bool, known: dict | None = None) -> dict:
     """Enrich (optional) -> sort into Artist/Album (optional) -> save."""
     report = {"matched": False, "source": None,
               "lyrics_embedded": False, "title": None}
     if want_meta or want_lyrics:
-        report = await enrich_file(local, want_meta, want_lyrics, fname)
+        report = await enrich_file(local, want_meta, want_lyrics, fname,
+                                   known)
     subdir = _sort_subdir(local) if sort else ""
     entry = await finish_save(local, fname, source, subdir)
     entry["enriched"] = report["matched"]
@@ -941,10 +987,210 @@ def fetch_with_ytdlp(url: str, workdir: str) -> list:
     produced = sorted(os.path.join(workdir, f) for f in os.listdir(workdir)
                       if f.lower().endswith(".mp3"))
     if proc.returncode != 0 or not produced:
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
         raise HTTPException(502, "yt-dlp could not fetch that link: "
-                            + (tail[-1] if tail else "unknown error"))
+                            + _clean_error(proc.stderr or proc.stdout))
     return produced
+
+
+# ---------------------------------------------------------------- Spotify --
+# Spotify track / album / playlist links resolve through Spotify's
+# public embed pages: the __NEXT_DATA__ JSON in the embed names every
+# track (playlists expose their first 50, the same cap as yt-dlp
+# playlist expansion). No Spotify account or token is involved. Audio
+# itself comes from yt-dlp search, and the exact Spotify metadata
+# rides along as `known` so tags and lyrics land right even when the
+# video's own title is a mess.
+
+_SPOTIFY_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z]{2}/)?(track|album|playlist)/"
+    r"([A-Za-z0-9]+)")
+_SPOTIFY_OTHER_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z]{2}/)?(episode|show|artist|user)/")
+SPOTIFY_MAX_TRACKS = 50
+
+
+def spotify_parse(url: str) -> tuple | None:
+    m = _SPOTIFY_RE.search(url or "")
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _find_entity(obj, uri: str, depth: int = 0):
+    """Locate the embed entity dict for `uri` in the page JSON."""
+    if depth > 10:
+        return None
+    if isinstance(obj, dict):
+        if obj.get("uri") == uri and ("title" in obj or "name" in obj):
+            return obj
+        for v in obj.values():
+            found = _find_entity(v, uri, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_entity(v, uri, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _spotify_cover(entity: dict) -> str | None:
+    images = ((entity.get("visualIdentity") or {}).get("image")) or []
+    best, best_w = None, -1
+    for img in images:
+        w = img.get("maxWidth") or 0
+        if img.get("url") and w > best_w:
+            best, best_w = img["url"], w
+    return best
+
+
+def _spotify_year(entity: dict) -> str:
+    iso = (entity.get("releaseDate") or {}).get("isoString") or ""
+    return iso[:4] if iso[:4].isdigit() else ""
+
+
+async def fetch_spotify_tracks(kind: str, sid: str) -> tuple:
+    """(entity title, [track, ...]) from the public embed page. Each
+    track: title / artist / album / year / track / cover_url."""
+    embed_url = f"{SPOTIFY_EMBED_BASE}/embed/{kind}/{sid}"
+    try:
+        async with httpx.AsyncClient(timeout=30, trust_env=False,
+                                     follow_redirects=True) as c:
+            r = await c.get(embed_url, headers=META_UA)
+            r.raise_for_status()
+            html = r.text
+    except Exception:
+        raise HTTPException(502, "Spotify could not be reached")
+    m = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html, re.S)
+    entity = None
+    if m:
+        try:
+            entity = _find_entity(json.loads(m.group(1)),
+                                  f"spotify:{kind}:{sid}")
+        except Exception:
+            entity = None
+    if entity is None:
+        raise HTTPException(502, "That Spotify link could not be read "
+                                 "(it may be private or removed)")
+    name = entity.get("title") or entity.get("name") or "Spotify"
+    cover = _spotify_cover(entity)
+    year = _spotify_year(entity)
+    tracks = []
+    if kind == "track":
+        artist = ", ".join(a.get("name", "") for a in
+                           entity.get("artists") or [] if a.get("name"))
+        tracks.append({"title": entity.get("title") or name,
+                       "artist": artist, "album": "", "year": year,
+                       "track": None, "cover_url": cover})
+    else:
+        for i, t in enumerate(entity.get("trackList") or []):
+            if not t.get("title"):
+                continue
+            tracks.append({
+                "title": t["title"],
+                "artist": t.get("subtitle") or "",
+                "album": name if kind == "album" else "",
+                "year": year if kind == "album" else "",
+                "track": (i + 1) if kind == "album" else None,
+                # A playlist's cover is a mosaic, not the song's art;
+                # leave it to the metadata sources.
+                "cover_url": cover if kind == "album" else None})
+    return name, tracks[:SPOTIFY_MAX_TRACKS]
+
+
+def fetch_spotify_audio(track: dict, workdir: str, index: int) -> str:
+    """One track's audio via yt-dlp search -> MP3 (same flags as the
+    page-link route). Raises HTTPException when nothing comes back."""
+    if not shutil.which("yt-dlp"):
+        raise HTTPException(
+            501, "Spotify downloads need yt-dlp, which is not installed "
+                 "on the server")
+    query = f"{track.get('artist', '')} - {track.get('title', '')}".strip(" -")
+    subdir = os.path.join(workdir, f"spotify{index:03d}")
+    os.makedirs(subdir, exist_ok=True)
+    proc = subprocess.run(
+        ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+         "--no-playlist", "-o",
+         os.path.join(subdir, "%(title)s.%(ext)s"),
+         f"ytsearch1:{query}"],
+        capture_output=True, text=True, timeout=900)
+    produced = sorted(os.path.join(subdir, f) for f in os.listdir(subdir)
+                      if f.lower().endswith(".mp3"))
+    if proc.returncode != 0 or not produced:
+        raise HTTPException(502, "yt-dlp found no audio for "
+                            f"'{query}': "
+                            + _clean_error(proc.stderr or proc.stdout))
+    return produced[0]
+
+
+# ------------------------------------------------------------ Google Drive --
+# Drive file links (drive.google.com/file/d/<id>, /open?id=, /uc?id= and
+# drive.usercontent.google.com/download?id=) fetch through Drive's own
+# direct-download endpoint; yt-dlp chokes on Drive's interstitial pages
+# and answers with a blob of HTML. The real filename (and the proof it
+# is audio at all) comes from the Content-Disposition header. The file
+# must be shared "anyone with the link" — Drive serves a sign-in page
+# otherwise, which is detected and reported plainly.
+
+_DRIVE_PATH_RE = re.compile(r"drive\.google\.com/file/d/([A-Za-z0-9_-]+)")
+
+
+def drive_file_id(url: str) -> str | None:
+    m = _DRIVE_PATH_RE.search(url or "")
+    if m:
+        return m.group(1)
+    try:
+        parsed = urllib.parse.urlparse(url or "")
+    except Exception:
+        return None
+    host = (parsed.netloc or "").lower()
+    if host in ("drive.google.com", "drive.usercontent.google.com"):
+        fid = (urllib.parse.parse_qs(parsed.query).get("id") or [""])[0]
+        if re.fullmatch(r"[A-Za-z0-9_-]+", fid or ""):
+            return fid
+    return None
+
+
+async def fetch_drive_file(file_id: str, workdir: str) -> tuple:
+    """(local path, filename) for a shared Drive file."""
+    dl = (f"{DRIVE_DOWNLOAD_BASE}/download?"
+          f"id={file_id}&export=download&confirm=t")
+    async with httpx.AsyncClient(timeout=900, follow_redirects=True,
+                                 trust_env=False) as client:
+        async with client.stream("GET", dl, headers=META_UA) as resp:
+            if resp.status_code != 200:
+                raise HTTPException(
+                    502, f"Google Drive returned HTTP {resp.status_code}")
+            ctype = (resp.headers.get("content-type") or "").lower()
+            cd = resp.headers.get("content-disposition") or ""
+            name = ""
+            m = re.search(r"filename\*=UTF-8''([^;]+)", cd)
+            if m:
+                name = urllib.parse.unquote(m.group(1).strip('"'))
+            if not name:
+                m = re.search(r'filename="([^"]+)"', cd)
+                if m:
+                    name = m.group(1)
+            name = sanitize_filename(name)
+            if (os.path.splitext(name)[1].lower() not in AUDIO_EXTS
+                    or "text/html" in ctype):
+                raise HTTPException(
+                    400, "That Drive link did not deliver an audio file. "
+                         "Make sure it is a single audio file shared "
+                         "with 'Anyone with the link'.")
+            dest = os.path.join(workdir, name)
+            size = 0
+            with open(dest, "wb") as out:
+                async for chunk in resp.aiter_bytes(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        raise HTTPException(
+                            413, "Downloaded file too large")
+                    out.write(chunk)
+    return dest, name
 
 
 @app.post("/url")
@@ -977,6 +1223,55 @@ async def upload_url(
             tmp = os.path.join(workdir, direct_name)
             await _download_to_file(url, tmp)
             return await save_processed(tmp, direct_name, "url",
+                                        want_meta, want_lyrics, want_sort)
+
+        # Spotify track / album / playlist: resolve the track list
+        # from the public embed page, fetch each song's audio through
+        # yt-dlp search, and tag with the exact Spotify metadata. A
+        # track that fails to download never sinks the rest of the
+        # album / playlist; it is reported in "failed_tracks".
+        if _SPOTIFY_OTHER_RE.search(url):
+            raise HTTPException(
+                400, "Only Spotify track, album and playlist links "
+                     "are supported")
+        sp = spotify_parse(url)
+        if sp:
+            _name, tracks = await fetch_spotify_tracks(*sp)
+            if not tracks:
+                raise HTTPException(
+                    502, "Spotify returned no tracks for that link")
+            saved, failed = [], []
+            for i, track in enumerate(tracks):
+                try:
+                    local = fetch_spotify_audio(track, workdir, i)
+                except HTTPException:
+                    failed.append(
+                        f"{track['artist']} - {track['title']}".strip(" -"))
+                    continue
+                fname = sanitize_filename(
+                    f"{track['artist']} - {track['title']}.mp3")
+                saved.append(await save_processed(
+                    local, fname, "url", want_meta, want_lyrics,
+                    want_sort, known=track))
+            if not saved:
+                raise HTTPException(
+                    502, "None of the tracks from that Spotify link "
+                         "could be downloaded")
+            first = saved[0]
+            first["via"] = "spotify"
+            if len(saved) > 1:
+                first["also_saved"] = len(saved) - 1
+                first["files"] = [dict(e) for e in saved]
+            if failed:
+                first["failed_tracks"] = failed
+            return first
+
+        # Google Drive file links go through Drive's direct-download
+        # endpoint (yt-dlp only gets Drive's HTML interstitial).
+        drive_id = drive_file_id(url)
+        if drive_id:
+            local, fname = await fetch_drive_file(drive_id, workdir)
+            return await save_processed(local, fname, "url",
                                         want_meta, want_lyrics, want_sort)
 
         # Debrid routes first when the link is on a provider's hoster

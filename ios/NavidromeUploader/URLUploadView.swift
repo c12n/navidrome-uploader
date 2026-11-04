@@ -65,7 +65,7 @@ struct URLUploadView: View {
                 } header: {
                     Text("Links")
                 } footer: {
-                    Text("One link per line. A YouTube playlist link adds every track in it (up to 50).")
+                    Text("One link per line. Spotify track, album and playlist links and YouTube playlists add every song in them (up to 50).")
                 }
 
                 Section {
@@ -98,7 +98,7 @@ struct URLUploadView: View {
                 }
 
                 Section {
-                    Text("Direct audio links (mp3, m4a, flac, wav, ogg, opus, aac) are fetched as-is. Links on supported file hosters are fetched through your TorBox or Premiumize account when a key is set. YouTube and other page links are handled on the server with yt-dlp. With metadata cleanup on (Settings), songs are identified and tagged, and lyrics are embedded into the file.")
+                    Text("Direct audio links (mp3, m4a, flac, wav, ogg, opus, aac) are fetched as-is. Google Drive file links download directly. Spotify links are resolved song by song and downloaded with their exact titles and artists. Links on supported file hosters are fetched through your TorBox or Premiumize account when a key is set. YouTube and other page links are handled on the server with yt-dlp. With metadata cleanup on (Settings), songs are identified and tagged, and lyrics are embedded into the file.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

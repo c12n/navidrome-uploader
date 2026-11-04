@@ -47,6 +47,7 @@ struct UploadResponse: Decodable {
     let lyricsEmbedded: Bool
     let matchedTitle: String?
     let files: [UploadResponse]
+    let failedTracks: [String]
 
     enum CodingKeys: String, CodingKey {
         case savedAs = "saved_as"
@@ -60,6 +61,7 @@ struct UploadResponse: Decodable {
         case lyricsEmbedded = "lyrics_embedded"
         case matchedTitle = "matched_title"
         case files
+        case failedTracks = "failed_tracks"
     }
 
     init(from decoder: Decoder) throws {
@@ -75,6 +77,7 @@ struct UploadResponse: Decodable {
         lyricsEmbedded = (try? c.decodeIfPresent(Bool.self, forKey: .lyricsEmbedded)) ?? nil ?? false
         matchedTitle = (try? c.decodeIfPresent(String.self, forKey: .matchedTitle)) ?? nil
         files = (try? c.decodeIfPresent([UploadResponse].self, forKey: .files)) ?? nil ?? []
+        failedTracks = (try? c.decodeIfPresent([String].self, forKey: .failedTracks)) ?? nil ?? []
     }
 
     /// Short human summary of the server-side processing, for history
@@ -89,6 +92,9 @@ struct UploadResponse: Decodable {
         if lyricsEmbedded { notes.append("Lyrics embedded") }
         if !folder.isEmpty { notes.append("Filed under \(folder)") }
         if let via { notes.append("via \(via)") }
+        if !failedTracks.isEmpty {
+            notes.append("\(failedTracks.count) track\(failedTracks.count == 1 ? "" : "s") couldn't be downloaded")
+        }
         return notes
     }
 }

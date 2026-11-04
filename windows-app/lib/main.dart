@@ -109,6 +109,7 @@ class UploadResult {
   final bool lyricsEmbedded;
   final String? matchedTitle;
   final List<UploadResult> files;
+  final List<String> failedTracks;
 
   const UploadResult({
     required this.savedAs,
@@ -122,6 +123,7 @@ class UploadResult {
     this.lyricsEmbedded = false,
     this.matchedTitle,
     this.files = const [],
+    this.failedTracks = const [],
   });
 
   factory UploadResult.fromJson(Map<String, dynamic> j) {
@@ -144,6 +146,9 @@ class UploadResult {
               .map(UploadResult.fromJson)
               .toList()
           : const [],
+      failedTracks: j['failed_tracks'] is List
+          ? (j['failed_tracks'] as List).map((e) => e.toString()).toList()
+          : const [],
     );
   }
 
@@ -159,6 +164,10 @@ class UploadResult {
     if (lyricsEmbedded) notes.add('Lyrics embedded');
     if (folder.isNotEmpty) notes.add('Filed under $folder');
     if (via != null) notes.add('via $via');
+    if (failedTracks.isNotEmpty) {
+      notes.add('${failedTracks.length} track'
+          '${failedTracks.length == 1 ? '' : 's'} couldn\'t be downloaded');
+    }
     return notes;
   }
 }
@@ -1990,7 +1999,10 @@ class _UrlPageState extends State<UrlPage> {
         const _SectionHeader('Add from a URL'),
         Text(
           'Paste a link and the server downloads it into your library. '
-          'A direct audio link is saved as-is. Links on supported '
+          'A direct audio link is saved as-is. Google Drive file links '
+          'download directly. Spotify track, album and playlist links '
+          'are resolved song by song and downloaded with their exact '
+          'titles and artists. Links on supported '
           'file hosters are fetched through your TorBox or Premiumize '
           'account when the server has a key for one. Any other page '
           'link — YouTube, SoundCloud and similar — is fetched on the '
@@ -2034,8 +2046,8 @@ class _UrlPageState extends State<UrlPage> {
         ),
         const SizedBox(height: 14),
         Text(
-          'One link per line. A YouTube playlist link adds every '
-          'track in it (up to 50).',
+          'One link per line. Spotify track, album and playlist links '
+          'and YouTube playlists add every song in them (up to 50).',
           style: theme.textTheme.bodyMedium
               ?.copyWith(color: scheme.onSurfaceVariant),
         ),
