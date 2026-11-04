@@ -160,6 +160,10 @@ struct CheckResponse: Decodable {
 
     let results: [Result]
 
+    enum CodingKeys: String, CodingKey {
+        case results
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         results = (try? c.decodeIfPresent([Result].self, forKey: .results)) ?? nil ?? []
@@ -218,6 +222,10 @@ struct ServerRecentEntry: Decodable {
 
 struct RecentResponse: Decodable {
     let uploads: [ServerRecentEntry]
+
+    enum CodingKeys: String, CodingKey {
+        case uploads
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
