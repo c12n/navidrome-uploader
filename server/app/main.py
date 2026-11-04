@@ -1276,7 +1276,11 @@ async def upload_url(
             saved, failed = [], []
             for i, track in enumerate(tracks):
                 try:
-                    local = fetch_spotify_audio(track, workdir, i)
+                    # to_thread: a track search can take minutes, and
+                    # the sync subprocess must not freeze the server's
+                    # event loop (stats/uploads) while it runs.
+                    local = await asyncio.to_thread(
+                        fetch_spotify_audio, track, workdir, i)
                 except HTTPException:
                     failed.append(
                         f"{track['artist']} - {track['title']}".strip(" -"))
@@ -1337,8 +1341,11 @@ async def upload_url(
                 provider_error = provider_error or exc
 
         # Anything else (YouTube, SoundCloud, a page link): yt-dlp -> MP3.
+        # to_thread for the same reason as the Spotify route: a long
+        # download must not freeze every other request.
         try:
-            produced_files = fetch_with_ytdlp(url, workdir)
+            produced_files = await asyncio.to_thread(
+                fetch_with_ytdlp, url, workdir)
         except HTTPException:
             if provider_error is not None:
                 raise provider_error
