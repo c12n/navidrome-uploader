@@ -188,7 +188,8 @@ struct SettingsView: View {
                 }
             }
             .fileImporter(isPresented: $showImporter,
-                          allowedContentTypes: [.json]) { result in
+                          allowedContentTypes: [.json],
+                          allowsMultipleSelection: false) { result in
                 if case .success(let urls) = result, let url = urls.first {
                     importKeys(from: url)
                 }
