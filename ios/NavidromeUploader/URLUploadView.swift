@@ -49,7 +49,7 @@ struct URLUploadView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Links") {
+                Section {
                     TextEditor(text: $linksText)
                         .frame(minHeight: 76)
                         .autocorrectionDisabled()
@@ -62,6 +62,8 @@ struct URLUploadView: View {
                         Label("Paste", systemImage: "doc.on.clipboard")
                     }
                     .disabled(isWorking)
+                } header: {
+                    Text("Links")
                 } footer: {
                     Text("One link per line. A YouTube playlist link adds every track in it (up to 50).")
                 }
