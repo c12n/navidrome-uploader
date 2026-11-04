@@ -1218,12 +1218,45 @@ async def upload_url(
     os.makedirs(DATA_DIR, exist_ok=True)
     workdir = tempfile.mkdtemp(dir=DATA_DIR)
     try:
-        direct_name = sanitize_filename(os.path.basename(urllib.parse.urlparse(url).path))
+        parsed_url = urllib.parse.urlparse(url)
+        direct_name = sanitize_filename(os.path.basename(parsed_url.path))
+        if os.path.splitext(direct_name)[1].lower() not in AUDIO_EXTS | {".zip"}:
+            # Some direct-download services (TorBox's CDN among them)
+            # keep the real filename in the query string instead of
+            # the path: .../zip/<uuid>?token=...&filename=songs.zip
+            qname = (urllib.parse.parse_qs(parsed_url.query)
+                     .get("filename") or [""])[0]
+            if qname:
+                direct_name = sanitize_filename(qname)
         if os.path.splitext(direct_name)[1].lower() in AUDIO_EXTS:
             tmp = os.path.join(workdir, direct_name)
             await _download_to_file(url, tmp)
             return await save_processed(tmp, direct_name, "url",
                                         want_meta, want_lyrics, want_sort)
+        if os.path.splitext(direct_name)[1].lower() == ".zip":
+            # A direct ZIP (an album bundle, a TorBox CDN zip link):
+            # download it and save every audio file inside, exactly
+            # like a debrid bundle.
+            tmp = os.path.join(workdir, direct_name)
+            await _download_to_file(url, tmp)
+            collected: list = []
+            try:
+                _collect_audio(tmp, direct_name, workdir, collected)
+            except Exception:
+                raise HTTPException(400, "That ZIP file could not be opened")
+            if not collected:
+                raise HTTPException(
+                    400, "That ZIP contains no audio files we can add")
+            saved = []
+            for local, fname in collected:
+                saved.append(await save_processed(
+                    local, fname, "url", want_meta, want_lyrics,
+                    want_sort))
+            first = saved[0]
+            if len(saved) > 1:
+                first["also_saved"] = len(saved) - 1
+                first["files"] = [dict(e) for e in saved]
+            return first
 
         # Spotify track / album / playlist: resolve the track list
         # from the public embed page, fetch each song's audio through
