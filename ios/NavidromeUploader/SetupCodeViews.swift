@@ -32,9 +32,12 @@ struct SetupPayload: Codable {
 
 enum QRCodeGenerator {
     static func image(from string: String) -> UIImage? {
-        let filter = CIFilter.qrCodeGenerator()
-        filter.message = Data(string.utf8)
-        filter.correctionLevel = "M"
+        // Classic name-based CoreImage API: the typed CIFilter
+        // convenience constructors are not exposed to this target.
+        guard let filter = CIFilter(name: "CIQRCodeGenerator")
+        else { return nil }
+        filter.setValue(Data(string.utf8), forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
         guard let output = filter.outputImage else { return nil }
         let scaled = output.transformed(
             by: CGAffineTransform(scaleX: 12, y: 12))
