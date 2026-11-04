@@ -48,7 +48,7 @@ const List<String> kAudioExtensions = [
 
 /// This build's marketing version (kept in step with pubspec.yaml;
 /// the update checker compares it against GitHub's latest release).
-const String kAppVersion = '0.4.0';
+const String kAppVersion = '0.5.0';
 
 /// Numeric dotted-version compare: is [candidate] newer than
 /// [current]? ("0.10.0" > "0.9.9")
@@ -129,6 +129,9 @@ class UploadResult {
   final String? matchedTitle;
   final List<UploadResult> files;
   final List<String> failedTracks;
+  // How the server pulled a direct download down (0.5.0).
+  final bool downloadAccelerated;
+  final int downloadConnections;
 
   const UploadResult({
     required this.savedAs,
@@ -143,10 +146,13 @@ class UploadResult {
     this.matchedTitle,
     this.files = const [],
     this.failedTracks = const [],
+    this.downloadAccelerated = false,
+    this.downloadConnections = 1,
   });
 
   factory UploadResult.fromJson(Map<String, dynamic> j) {
     final rawFiles = j['files'];
+    final dl = j['download'];
     return UploadResult(
       savedAs: (j['saved_as'] ?? j['savedAs'] ?? '').toString(),
       size: (j['size'] as num?)?.toInt() ?? 0,
@@ -168,6 +174,11 @@ class UploadResult {
       failedTracks: j['failed_tracks'] is List
           ? (j['failed_tracks'] as List).map((e) => e.toString()).toList()
           : const [],
+      downloadAccelerated:
+          dl is Map<String, dynamic> && dl['accelerated'] == true,
+      downloadConnections: dl is Map<String, dynamic>
+          ? (dl['connections'] as num?)?.toInt() ?? 1
+          : 1,
     );
   }
 
@@ -181,6 +192,9 @@ class UploadResult {
       notes.add('Metadata cleaned up');
     }
     if (lyricsEmbedded) notes.add('Lyrics embedded');
+    if (downloadAccelerated) {
+      notes.add('⚡ Accelerated download ×$downloadConnections');
+    }
     if (folder.isNotEmpty) notes.add('Filed under $folder');
     if (via != null) notes.add('via $via');
     if (failedTracks.isNotEmpty) {
@@ -2265,7 +2279,8 @@ class _UrlPageState extends State<UrlPage> {
           lines.add(res.alsoSaved == 1
               ? '+ 1 more file from this link'
               : '+ ${res.alsoSaved} more files from this link');
-        } else if (res.processingNotes.isNotEmpty) {
+        }
+        if (res.processingNotes.isNotEmpty) {
           lines.add(res.processingNotes.join(' · '));
         }
         if (item.libraryNote != null) lines.add(item.libraryNote!);

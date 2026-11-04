@@ -22,6 +22,11 @@ service is the missing front door. It runs on the same box as Navidrome
                      * any other page/media link (YouTube etc.) is fetched
                        with yt-dlp and extracted to MP3 (needs ffmpeg,
                        installed by the container start command)
+                     * if yt-dlp cannot handle a website, a generic
+                       website downloader inspects the returned page or
+                       download endpoint for public audio, ZIP, video or
+                       HLS links and fetches those directly (it does not
+                       bypass logins, paywalls or CAPTCHAs)
   - after every save it triggers a Navidrome library scan through the
     Subsonic API (startScan) when NAVIDROME_USER/PASSWORD are configured,
     so new songs appear in Navidrome within seconds
@@ -44,6 +49,7 @@ Copyright (c) 2026 c12n Apps
 import asyncio
 import difflib
 import hashlib
+import html
 import json
 import os
 import re
@@ -65,6 +71,7 @@ AUDIO_EXTS = {
     ".mp3", ".m4a", ".flac", ".wav", ".ogg", ".oga", ".opus",
     ".aac", ".aif", ".aiff", ".wma",
 }
+VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mkv", ".mov"}
 MAX_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "500")) * 1024 * 1024
 
 LIBRARY_DIR = os.environ.get("LIBRARY_DIR", "/music")
@@ -816,18 +823,129 @@ def _collect_audio(local: str, fname: str, workdir: str, results: list) -> None:
         results.append((local, fname))
 
 
-async def _download_to_file(url: str, dest: str) -> None:
-    async with httpx.AsyncClient(timeout=900, follow_redirects=True, trust_env=False) as client:
-        async with client.stream("GET", url) as resp:
+# Accelerated downloads (0.5.0): when a source supports HTTP range
+# requests and the file is big enough to matter, pull it down over
+# several parallel connections with per-segment resume - the trick
+# download managers use - and fall back to the plain single stream
+# whenever the source doesn't cooperate. Every direct route funnels
+# through _download_to_file (direct audio / ZIP links incl. TorBox
+# CDN bundles, and the TorBox / Premiumize fetchers), so they all
+# get it. yt-dlp routes already parallelise internally; Drive keeps
+# its own fetch.
+ACCEL_CONNECTIONS = 4
+ACCEL_MIN_BYTES = 8 * 1024 * 1024
+ACCEL_ATTEMPTS = 3
+
+
+async def _stream_body(resp, dest: str) -> int:
+    size = 0
+    with open(dest, "wb") as out:
+        async for chunk in resp.aiter_bytes(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_BYTES:
+                raise HTTPException(413, "Downloaded file too large")
+            out.write(chunk)
+    return size
+
+
+async def _download_segment(client, url: str, part: str, start: int,
+                            end: int, headers) -> bool:
+    """One byte range into its part file, resuming across attempts."""
+    want = end - start + 1
+    for _attempt in range(ACCEL_ATTEMPTS):
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        if have >= want:
+            return have == want
+        try:
+            async with client.stream(
+                    "GET", url,
+                    headers={**(headers or {}),
+                             "Range": f"bytes={start + have}-{end}"}) as resp:
+                if resp.status_code != 206:
+                    return False  # range support vanished: caller falls back
+                with open(part, "ab") as out:
+                    async for chunk in resp.aiter_bytes(1024 * 1024):
+                        out.write(chunk)
+        except HTTPException:
+            raise
+        except Exception:
+            continue  # dropped mid-segment: resume from the part size
+    return os.path.exists(part) and os.path.getsize(part) == want
+
+
+async def _download_ranged(client, url: str, dest: str, total: int,
+                           headers) -> bool:
+    seg = -(-total // ACCEL_CONNECTIONS)
+    ranges = [(s, min(s + seg, total) - 1)
+              for s in range(0, total, seg)]
+    parts = [f"{dest}.part{i}" for i in range(len(ranges))]
+    try:
+        ok = all(await asyncio.gather(*(
+            _download_segment(client, url, part, s, e, headers)
+            for part, (s, e) in zip(parts, ranges))))
+        if not ok:
+            return False
+        with open(dest, "wb") as out:
+            for part in parts:
+                with open(part, "rb") as fh:
+                    shutil.copyfileobj(fh, out)
+        return os.path.getsize(dest) == total
+    except Exception:
+        return False
+    finally:
+        for part in parts:
+            if os.path.exists(part):
+                os.unlink(part)
+
+
+async def _download_to_file(url: str, dest: str, headers=None) -> dict:
+    """Download url to dest; returns {accelerated, connections, bytes,
+    seconds} describing how it actually came down."""
+    started = time.monotonic()
+    info = {"accelerated": False, "connections": 1, "bytes": 0}
+    async with httpx.AsyncClient(timeout=900, follow_redirects=True,
+                                 trust_env=False) as client:
+        total = None
+        try:
+            async with client.stream(
+                    "GET", url,
+                    headers={**(headers or {}),
+                             "Range": "bytes=0-0"}) as resp:
+                if resp.status_code == 206:
+                    m = re.match(r"bytes 0-0/(\d+)$",
+                                 resp.headers.get("content-range", ""))
+                    if m:
+                        total = int(m.group(1))
+                elif resp.status_code == 200:
+                    # The source ignored the range probe: this
+                    # response IS the whole file, stream it as-is.
+                    info["bytes"] = await _stream_body(resp, dest)
+                    info["seconds"] = round(time.monotonic() - started, 2)
+                    return info
+                else:
+                    raise HTTPException(
+                        502, f"Download source returned HTTP "
+                             f"{resp.status_code}")
+        except HTTPException:
+            raise
+        except Exception:
+            total = None  # probe failed: try the plain path below
+        if total is not None:
+            if total > MAX_BYTES:
+                raise HTTPException(413, "Downloaded file too large")
+            if total >= ACCEL_MIN_BYTES and await _download_ranged(
+                    client, url, dest, total, headers):
+                info.update(accelerated=True,
+                            connections=ACCEL_CONNECTIONS, bytes=total)
+                info["seconds"] = round(time.monotonic() - started, 2)
+                return info
+        async with client.stream("GET", url, headers=headers) as resp:
             if resp.status_code != 200:
-                raise HTTPException(502, f"Download source returned HTTP {resp.status_code}")
-            size = 0
-            with open(dest, "wb") as out:
-                async for chunk in resp.aiter_bytes(1024 * 1024):
-                    size += len(chunk)
-                    if size > MAX_BYTES:
-                        raise HTTPException(413, "Downloaded file too large")
-                    out.write(chunk)
+                raise HTTPException(
+                    502, f"Download source returned HTTP {resp.status_code}")
+            info["bytes"] = await _stream_body(resp, dest)
+    info["seconds"] = round(time.monotonic() - started, 2)
+    return info
 
 
 async def fetch_with_torbox(url: str, workdir: str, key: str = "") -> list:
@@ -1033,6 +1151,263 @@ def fetch_with_ytdlp(url: str, workdir: str) -> list:
         raise HTTPException(502, "yt-dlp could not fetch that link: "
                             + _clean_error(proc.stderr or proc.stdout))
     return produced
+
+
+# ------------------------------------------------------- Website fallback --
+# Some public websites are not supported by yt-dlp and are not direct
+# files: a download endpoint may hide its filename in response headers,
+# or an ordinary page may expose the actual media in an <audio>/<source>
+# tag, an Open Graph tag, JSON-LD, a normal download link, page scripts,
+# or an HLS playlist. This last-resort downloader fetches the page like a
+# regular client, extracts those public candidates, and downloads them
+# through the same accelerated direct downloader. It does not log in,
+# solve CAPTCHAs, or bypass paywalls / access controls.
+WEBSITE_PAGE_MAX_BYTES = 8 * 1024 * 1024
+WEBSITE_MAX_FILES = 50
+WEBSITE_EXTS = AUDIO_EXTS | VIDEO_EXTS | {".zip", ".m3u8"}
+
+_CONTENT_TYPE_EXTS = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "application/zip": ".zip",
+    "application/x-zip-compressed": ".zip",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "application/vnd.apple.mpegurl": ".m3u8",
+    "application/x-mpegurl": ".m3u8",
+}
+
+
+def _website_url_ext(url: str) -> str:
+    parsed = urllib.parse.urlparse(url or "")
+    ext = os.path.splitext(parsed.path)[1].lower()
+    if ext:
+        return ext
+    qname = (urllib.parse.parse_qs(parsed.query).get("filename")
+             or [""])[0]
+    return os.path.splitext(qname)[1].lower() if qname else ""
+
+
+def _website_filename(url: str, headers=None, fallback: str = "Website Download") -> str:
+    headers = headers or {}
+    cd = headers.get("content-disposition") or ""
+    name = ""
+    m = re.search(r"filename\*=UTF-8''([^;]+)", cd)
+    if m:
+        name = urllib.parse.unquote(m.group(1).strip('"'))
+    if not name:
+        m = re.search(r'filename="([^"]+)"', cd)
+        if m:
+            name = m.group(1)
+    if not name:
+        parsed = urllib.parse.urlparse(url or "")
+        name = (urllib.parse.parse_qs(parsed.query).get("filename")
+                or [""])[0]
+        if not name:
+            name = os.path.basename(parsed.path)
+    name = sanitize_filename(urllib.parse.unquote(name or ""))
+    return name or sanitize_filename(fallback)
+
+
+def _website_rank(url: str) -> int:
+    ext = _website_url_ext(url)
+    if ext == ".zip":
+        return 0
+    if ext in AUDIO_EXTS:
+        return 1
+    if ext == ".m3u8":
+        return 2
+    if ext in VIDEO_EXTS:
+        return 3
+    return 99
+
+
+def _extract_website_candidates(page_url: str, page_text: str) -> list:
+    """Public media URLs exposed by a page, best candidates first."""
+    text = (page_text or "").replace("\\/", "/")
+    raw_values = []
+    raw_values.extend(re.findall(
+        r"(?:href|src|content|data-src|data-url)\s*=\s*[\"']([^\"']+)[\"']",
+        text, flags=re.IGNORECASE))
+    raw_values.extend(re.findall(r"https?://[^\s\"'<>\\]+", text))
+    found = {}
+    for order, raw in enumerate(raw_values):
+        value = html.unescape(str(raw)).strip().strip(".,);]}\"'")
+        if not value:
+            continue
+        absolute = urllib.parse.urljoin(page_url, value)
+        parsed = urllib.parse.urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        absolute = urllib.parse.urldefrag(absolute)[0]
+        if absolute.rstrip("/") == (page_url or "").rstrip("/"):
+            continue
+        if _website_url_ext(absolute) not in WEBSITE_EXTS:
+            continue
+        found.setdefault(absolute, (_website_rank(absolute), order))
+    ranked = sorted(found.items(), key=lambda item: item[1])
+    return [url for url, _rank in ranked[:WEBSITE_MAX_FILES]]
+
+
+def _convert_video_to_mp3(local: str, workdir: str, index: int) -> str:
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(
+            501, "This website returned video, but ffmpeg is not installed "
+                 "on the server to extract its audio")
+    out = os.path.join(workdir, f"website-audio-{index}.mp3")
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-i", local, "-vn", "-codec:a", "libmp3lame",
+         "-q:a", "0", out],
+        capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0 or not os.path.exists(out):
+        raise HTTPException(502, "The website video could not be converted "
+                            "to audio: " + _clean_error(proc.stderr))
+    return out
+
+
+def _fetch_hls_sync(url: str, workdir: str, index: int, referer: str) -> str:
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(
+            501, "This website uses an HLS stream, but ffmpeg is not "
+                 "installed on the server")
+    out = os.path.join(workdir, f"website-stream-{index}.mp3")
+    ua = META_UA.get("User-Agent", "Mozilla/5.0")
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-user_agent", ua,
+         "-headers", f"Referer: {referer}\r\n",
+         "-i", url, "-vn", "-codec:a", "libmp3lame", "-q:a", "0", out],
+        capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0 or not os.path.exists(out):
+        raise HTTPException(502, "The website stream could not be "
+                            "downloaded: " + _clean_error(proc.stderr))
+    return out
+
+
+async def _append_website_payload(local: str, fname: str, workdir: str,
+                                  results: list, index: int) -> None:
+    ext = os.path.splitext(fname)[1].lower()
+    if ext in AUDIO_EXTS or ext == ".zip":
+        _collect_audio(local, fname, workdir, results)
+    elif ext in VIDEO_EXTS:
+        converted = await asyncio.to_thread(
+            _convert_video_to_mp3, local, workdir, index)
+        stem = os.path.splitext(fname)[0] or f"Website Download {index + 1}"
+        results.append((converted, sanitize_filename(stem + ".mp3")))
+
+
+async def fetch_from_website(url: str, workdir: str) -> list:
+    """Last-resort public website downloader.
+
+    Returns [(local_path, filename), ...] containing audio only. A URL
+    may itself be a header-described download endpoint, an HLS playlist,
+    or an HTML page with exposed media/download links. Network-level
+    failures become a clean 502, never a server crash - this runs as a
+    fallback, so the original route's error must stay in charge.
+    """
+    try:
+        return await _fetch_from_website(url, workdir)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, "That website could not be fetched: "
+                            + _clean_error(str(exc)))
+
+
+async def _fetch_from_website(url: str, workdir: str) -> list:
+    if _website_url_ext(url) == ".m3u8":
+        local = await asyncio.to_thread(_fetch_hls_sync, url, workdir, 0, url)
+        return [(local, "Website Stream.mp3")]
+
+    headers = {**META_UA, "Accept": "*/*"}
+    results: list = []
+    page_text = ""
+    final_url = url
+    async with httpx.AsyncClient(timeout=900, follow_redirects=True,
+                                 trust_env=False) as client:
+        async with client.stream("GET", url, headers=headers) as resp:
+            if resp.status_code != 200:
+                raise HTTPException(
+                    502, f"Website returned HTTP {resp.status_code}")
+            final_url = str(resp.url)
+            ctype = (resp.headers.get("content-type") or "")
+            ctype = ctype.split(";")[0].strip().lower()
+            fname = _website_filename(final_url, resp.headers)
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in WEBSITE_EXTS:
+                ext = _CONTENT_TYPE_EXTS.get(ctype, "")
+                if ext:
+                    fname = sanitize_filename(
+                        os.path.splitext(fname)[0] + ext)
+            if ext in AUDIO_EXTS or ext == ".zip" or ext in VIDEO_EXTS:
+                local = os.path.join(workdir, f"website-0-{fname}")
+                await _stream_body(resp, local)
+                await _append_website_payload(
+                    local, fname, workdir, results, 0)
+                if results:
+                    return results
+                raise HTTPException(
+                    422, "That website download contained no usable audio")
+            if ext == ".m3u8":
+                local = await asyncio.to_thread(
+                    _fetch_hls_sync, final_url, workdir, 0, url)
+                return [(local, "Website Stream.mp3")]
+            if ctype not in ("text/html", "application/xhtml+xml", ""):
+                raise HTTPException(
+                    422, "That website did not return a page or a "
+                         "download NaviUpload can use")
+            body = bytearray()
+            async for chunk in resp.aiter_bytes(1024 * 256):
+                body.extend(chunk)
+                if len(body) >= WEBSITE_PAGE_MAX_BYTES:
+                    del body[WEBSITE_PAGE_MAX_BYTES:]
+                    break
+            encoding = resp.encoding or "utf-8"
+            page_text = body.decode(encoding, errors="ignore")
+
+    candidates = _extract_website_candidates(final_url, page_text)
+    if not candidates:
+        raise HTTPException(
+            422, "That website did not expose a downloadable audio file, "
+                 "ZIP, video or stream. Login-only and CAPTCHA-protected "
+                 "pages cannot be fetched this way")
+    download_headers = {**META_UA, "Referer": final_url}
+    errors = []
+    for i, candidate in enumerate(candidates):
+        ext = _website_url_ext(candidate)
+        fname = _website_filename(candidate)
+        if ext and os.path.splitext(fname)[1].lower() != ext:
+            fname = sanitize_filename(fname + ext)
+        try:
+            if ext == ".m3u8":
+                local = await asyncio.to_thread(
+                    _fetch_hls_sync, candidate, workdir, i, final_url)
+                stem = os.path.splitext(fname)[0] or f"Website Stream {i + 1}"
+                results.append((local, sanitize_filename(stem + ".mp3")))
+                continue
+            local = os.path.join(workdir, f"website-{i}-{fname}")
+            await _download_to_file(candidate, local,
+                                    headers=download_headers)
+            await _append_website_payload(
+                local, fname, workdir, results, i)
+        except HTTPException as exc:
+            errors.append(str(exc.detail))
+        except Exception as exc:  # one bad candidate must not sink the rest
+            errors.append(_clean_error(str(exc)))
+    if not results:
+        detail = f": {errors[0]}" if errors else ""
+        raise HTTPException(
+            502, "The website exposed media links, but none could be "
+                 f"downloaded{detail}")
+    return results[:WEBSITE_MAX_FILES]
 
 
 # ---------------------------------------------------------------- Spotify --
@@ -1273,15 +1648,17 @@ async def upload_url(
                 direct_name = sanitize_filename(qname)
         if os.path.splitext(direct_name)[1].lower() in AUDIO_EXTS:
             tmp = os.path.join(workdir, direct_name)
-            await _download_to_file(url, tmp)
-            return await save_processed(tmp, direct_name, "url",
-                                        want_meta, want_lyrics, want_sort)
+            dl_info = await _download_to_file(url, tmp)
+            result = await save_processed(tmp, direct_name, "url",
+                                          want_meta, want_lyrics, want_sort)
+            result["download"] = dl_info
+            return result
         if os.path.splitext(direct_name)[1].lower() == ".zip":
             # A direct ZIP (an album bundle, a TorBox CDN zip link):
             # download it and save every audio file inside, exactly
             # like a debrid bundle.
             tmp = os.path.join(workdir, direct_name)
-            await _download_to_file(url, tmp)
+            dl_info = await _download_to_file(url, tmp)
             collected: list = []
             try:
                 _collect_audio(tmp, direct_name, workdir, collected)
@@ -1296,6 +1673,7 @@ async def upload_url(
                     local, fname, "url", want_meta, want_lyrics,
                     want_sort))
             first = saved[0]
+            first["download"] = dl_info
             if len(saved) > 1:
                 first["also_saved"] = len(saved) - 1
                 first["files"] = [dict(e) for e in saved]
@@ -1385,20 +1763,31 @@ async def upload_url(
 
         # Anything else (YouTube, SoundCloud, a page link): yt-dlp -> MP3.
         # to_thread for the same reason as the Spotify route: a long
-        # download must not freeze every other request.
+        # download must not freeze every other request. If yt-dlp does
+        # not support the website, make one last attempt with the
+        # generic website downloader before giving up.
         try:
             produced_files = await asyncio.to_thread(
                 fetch_with_ytdlp, url, workdir)
-        except HTTPException:
-            if provider_error is not None:
-                raise provider_error
-            raise
+            website_files = [(path, os.path.basename(path))
+                             for path in produced_files]
+            via = None
+        except HTTPException as ytdlp_error:
+            try:
+                website_files = await fetch_from_website(url, workdir)
+                via = "website"
+            except HTTPException:
+                if provider_error is not None:
+                    raise provider_error
+                raise ytdlp_error
         saved = []
-        for produced in produced_files:
+        for produced, fname in website_files:
             saved.append(await save_processed(
-                produced, os.path.basename(produced), "url",
+                produced, fname, "url",
                 want_meta, want_lyrics, want_sort))
         first = saved[0]
+        if via:
+            first["via"] = via
         if len(saved) > 1:
             first["also_saved"] = len(saved) - 1
             first["files"] = [dict(e) for e in saved]

@@ -35,6 +35,23 @@ struct HealthResponse: Decodable {
 /// POST /upload and POST /url. 0.2.0 servers add processing details
 /// (enrichment, lyrics, folder, multi-file "files" for playlists and
 /// debrid ZIPs); all decoded leniently so 1.x servers still work.
+/// How the server pulled a direct download down (0.5.0): parallel
+/// ranged connections when the source supports them.
+struct DownloadInfo: Decodable {
+    let accelerated: Bool
+    let connections: Int
+
+    enum CodingKeys: String, CodingKey {
+        case accelerated, connections
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        accelerated = (try? c.decodeIfPresent(Bool.self, forKey: .accelerated)) ?? nil ?? false
+        connections = (try? c.decodeIfPresent(Int.self, forKey: .connections)) ?? nil ?? 1
+    }
+}
+
 struct UploadResponse: Decodable {
     let savedAs: String
     let size: Int
@@ -48,6 +65,7 @@ struct UploadResponse: Decodable {
     let matchedTitle: String?
     let files: [UploadResponse]
     let failedTracks: [String]
+    let download: DownloadInfo?
 
     enum CodingKeys: String, CodingKey {
         case savedAs = "saved_as"
@@ -62,6 +80,7 @@ struct UploadResponse: Decodable {
         case matchedTitle = "matched_title"
         case files
         case failedTracks = "failed_tracks"
+        case download
     }
 
     init(from decoder: Decoder) throws {
@@ -78,6 +97,7 @@ struct UploadResponse: Decodable {
         matchedTitle = (try? c.decodeIfPresent(String.self, forKey: .matchedTitle)) ?? nil
         files = (try? c.decodeIfPresent([UploadResponse].self, forKey: .files)) ?? nil ?? []
         failedTracks = (try? c.decodeIfPresent([String].self, forKey: .failedTracks)) ?? nil ?? []
+        download = (try? c.decodeIfPresent(DownloadInfo.self, forKey: .download)) ?? nil
     }
 
     /// Short human summary of the server-side processing, for history
@@ -90,6 +110,9 @@ struct UploadResponse: Decodable {
             notes.append("Metadata cleaned up")
         }
         if lyricsEmbedded { notes.append("Lyrics embedded") }
+        if let download, download.accelerated {
+            notes.append("⚡ Accelerated download ×\(download.connections)")
+        }
         if !folder.isEmpty { notes.append("Filed under \(folder)") }
         if let via { notes.append("via \(via)") }
         if !failedTracks.isEmpty {
