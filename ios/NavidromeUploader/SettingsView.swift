@@ -8,6 +8,8 @@
 //
 
 import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @Environment(SettingsStore.self) private var settings
@@ -18,6 +20,10 @@ struct SettingsView: View {
     @State private var showSetupQR = false
     @State private var showSetupScanner = false
     @State private var setupNote: String?
+    @State private var showShareSheet = false
+    @State private var exportURL: URL?
+    @State private var showImporter = false
+    @State private var backupNote: String?
 
     var body: some View {
         @Bindable var settings = settings
@@ -74,7 +80,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Processing")
                 } footer: {
-                    Text("The server identifies each song (iTunes, then MusicBrainz + Cover Art Archive) and embeds proper title, artist, album and cover art into the audio file. Lyrics come from LRCLIB and are embedded into the file too, so they show in any player. File uploads are left untagged by default \u{2014} albums usually arrive already tagged.")
+                    Text("The server identifies each song (iTunes, then MusicBrainz + Cover Art Archive) and embeds proper title, artist, album and cover art into the audio file. Lyrics come from LRCLIB \u{2014} a second source is tried when LRCLIB has none \u{2014} and are embedded into the file too, so they show in any player. File uploads are left untagged by default \u{2014} albums usually arrive already tagged.")
                 }
 
                 Section {
@@ -125,6 +131,40 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    NavigationLink {
+                        DuplicateFinderView()
+                    } label: {
+                        Label("Find duplicate songs", systemImage: "doc.on.doc")
+                    }
+                } header: {
+                    Text("Library")
+                } footer: {
+                    Text("Songs that exist more than once in your library, and the space the extra copies waste. Deleting happens on the server, from inside the app.")
+                }
+
+                Section {
+                    Button {
+                        exportKeys()
+                    } label: {
+                        Label("Export keys as JSON", systemImage: "square.and.arrow.up")
+                    }
+                    Button {
+                        showImporter = true
+                    } label: {
+                        Label("Import keys from JSON", systemImage: "square.and.arrow.down")
+                    }
+                    if let backupNote {
+                        Text(backupNote)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Backup")
+                } footer: {
+                    Text("One JSON file with your server, upload token and both debrid keys \u{2014} the same file works in the Windows app. Importing fills in whatever the file carries and leaves the rest as-is. The file contains your keys: treat it like a password.")
+                }
+
+                Section {
                     LabeledContent("Version", value: Self.versionString)
                 } footer: {
                     Text("NaviUpload \u{2014} upload music to your Navidrome library from files or URLs.")
@@ -140,6 +180,17 @@ struct SettingsView: View {
                     settings.token = payload.token
                     showSetupScanner = false
                     setupNote = "Setup applied from the scanned code \u{2014} run Test connection to confirm."
+                }
+            }
+            .sheet(isPresented: $showShareSheet) {
+                if let exportURL {
+                    ActivityView(items: [exportURL])
+                }
+            }
+            .fileImporter(isPresented: $showImporter,
+                          allowedContentTypes: [.json]) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    importKeys(from: url)
                 }
             }
         }
@@ -174,6 +225,42 @@ struct SettingsView: View {
         return "\(v) (\(b))"
     }
 
+    /// Write the keys backup JSON to a temp file and share it.
+    private func exportKeys() {
+        guard let data = settings.backupJSONData() else {
+            backupNote = "Could not build the backup file."
+            return
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NaviUpload-Keys.json")
+        do {
+            try data.write(to: url, options: .atomic)
+            exportURL = url
+            backupNote = nil
+            showShareSheet = true
+        } catch {
+            backupNote = "Could not write the backup file: \(error.localizedDescription)"
+        }
+    }
+
+    /// Read a keys backup JSON back in and apply what it carries.
+    private func importKeys(from url: URL) {
+        do {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let data = try Data(contentsOf: url)
+            let backup = try JSONDecoder().decode(KeysBackup.self, from: data)
+            guard backup.app == "NaviUpload" else {
+                backupNote = "That file is not a NaviUpload keys backup."
+                return
+            }
+            settings.applyBackup(backup)
+            backupNote = "Keys imported \u{2014} run Test connection to confirm."
+        } catch {
+            backupNote = "Could not read that file \u{2014} it is not a valid NaviUpload JSON backup."
+        }
+    }
+
     private func testConnection() {
         isTesting = true
         testResult = nil
@@ -206,4 +293,18 @@ struct SettingsView: View {
             isTesting = false
         }
     }
+}
+
+/// The system share sheet, for handing the exported keys file to
+/// Files, AirDrop, mail — wherever the user keeps backups.
+private struct ActivityView: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items,
+                                 applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController,
+                                context: Context) {}
 }

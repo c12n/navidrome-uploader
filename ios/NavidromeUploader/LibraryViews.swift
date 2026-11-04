@@ -130,3 +130,146 @@ struct LibraryCardView: View {
         isRefreshing = false
     }
 }
+
+// MARK: - Duplicate finder
+
+/// Songs that exist more than once in the library (server-side
+/// GET /duplicates), with per-copy delete via POST /delete. The
+/// biggest copy of each song is marked as the keeper; deleting is
+/// always confirmed first and takes effect on the server at once.
+struct DuplicateFinderView: View {
+    @Environment(SettingsStore.self) private var settings
+
+    @State private var result: DuplicatesResponse?
+    @State private var isLoading = true
+    @State private var errorText: String?
+    @State private var pendingDelete: [DuplicateFile] = []
+    @State private var showConfirm = false
+    @State private var isDeleting = false
+    @State private var note: String?
+
+    var body: some View {
+        Group {
+            if isLoading {
+                ProgressView("Scanning the library\u{2026}")
+            } else if let errorText {
+                ContentUnavailableView(
+                    "Could not scan",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(errorText))
+            } else if let result, result.groups.isEmpty {
+                ContentUnavailableView(
+                    "No duplicates",
+                    systemImage: "checkmark.circle",
+                    description: Text(
+                        "Every song in your library exists exactly once."))
+            } else if let result {
+                List {
+                    Section {
+                        Text("\(result.groupCount) songs are duplicated "
+                             + "(\(result.fileCount) files) \u{00B7} "
+                             + ByteCountFormatter.string(
+                                fromByteCount: Int64(result.wastedBytes),
+                                countStyle: .file)
+                             + " wasted")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        if let note {
+                            Text(note).font(.footnote)
+                        }
+                    }
+                    ForEach(result.groups, id: \.files.first?.file) { group in
+                        Section {
+                            ForEach(
+                                Array(group.files.enumerated()),
+                                id: \.element.file) { index, file in
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(file.file)
+                                            .font(.footnote)
+                                            .lineLimit(2)
+                                        Text(ByteCountFormatter.string(
+                                            fromByteCount: Int64(file.size),
+                                            countStyle: .file))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if index == 0 {
+                                        Text("Keep")
+                                            .font(.caption.bold())
+                                            .foregroundStyle(.green)
+                                    } else {
+                                        Button("Delete", role: .destructive) {
+                                            pendingDelete = [file]
+                                            showConfirm = true
+                                        }
+                                        .disabled(isDeleting)
+                                    }
+                                }
+                            }
+                            if group.files.count > 2 {
+                                Button("Delete extra copies", role: .destructive) {
+                                    pendingDelete = Array(group.files.dropFirst())
+                                    showConfirm = true
+                                }
+                                .disabled(isDeleting)
+                            }
+                        } header: {
+                            Text(group.artist.isEmpty
+                                 ? group.title
+                                 : "\(group.artist) \u{2014} \(group.title)")
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Duplicate songs")
+        .task { await load() }
+        .confirmationDialog(
+            pendingDelete.count == 1
+                ? "Delete this copy from the library?"
+                : "Delete \(pendingDelete.count) copies from the library?",
+            isPresented: $showConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                Task { await deletePending() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the file from your server for good. "
+                 + "The biggest copy of each song is kept.")
+        }
+    }
+
+    private func load() async {
+        isLoading = true
+        errorText = nil
+        do {
+            result = try await settings.client.duplicates()
+        } catch {
+            errorText = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func deletePending() async {
+        let files = pendingDelete.map(\.file)
+        guard !files.isEmpty else { return }
+        isDeleting = true
+        do {
+            let response = try await settings.client.deleteFiles(files)
+            note = response.errors.isEmpty
+                ? "Deleted \(response.deleted.count) file(s)."
+                : "Deleted \(response.deleted.count); "
+                    + "\(response.errors.count) could not be deleted."
+            await load()
+        } catch {
+            note = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+        }
+        isDeleting = false
+    }
+}

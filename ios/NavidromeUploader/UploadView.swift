@@ -49,6 +49,9 @@ struct UploadView: View {
     @State private var note: String?
     @State private var noteIsError = false
     @State private var cardReload = 0
+    @State private var availableUpdate: AvailableUpdate?
+    @State private var dismissedUpdateVersion: String? =
+        UserDefaults.standard.string(forKey: "update.dismissedVersion")
 
     private var pickerTypes: [UTType] {
         var types: [UTType] = [.audio, .mp3, .mpeg4Audio, .wav, .aiff, .folder]
@@ -72,6 +75,37 @@ struct UploadView: View {
     var body: some View {
         NavigationStack {
             List {
+                if let update = availableUpdate,
+                   update.version != dismissedUpdateVersion {
+                    Section {
+                        HStack(spacing: 10) {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .foregroundStyle(.blue)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("NaviUpload \(update.version) is available")
+                                    .font(.subheadline.bold())
+                                Text("Get the new build from the GitHub release page.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Link("View", destination: update.pageURL)
+                                .font(.subheadline.bold())
+                            Button {
+                                dismissedUpdateVersion = update.version
+                                UserDefaults.standard.set(
+                                    update.version,
+                                    forKey: "update.dismissedVersion")
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.footnote.bold())
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
                 Section {
                     LibraryCardView(reloadToken: cardReload)
                         .listRowInsets(EdgeInsets())
@@ -162,6 +196,11 @@ struct UploadView: View {
                 // Ask once so a background-finished queue can notify.
                 UNUserNotificationCenter.current()
                     .requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            }
+            .task {
+                // Update banner: GitHub's latest release vs this build
+                // (the checker itself throttles to every 6 hours).
+                availableUpdate = await UpdateChecker.availableUpdate()
             }
         }
     }

@@ -178,7 +178,9 @@ struct URLUploadView: View {
                         target, enrich: enrich, lyrics: lyrics, sort: sort)
                     rows[index].state = .done
                     rows[index].response = response
-                    history.add(name: target, source: .url, response: response)
+                    history.add(name: target, source: .url, response: response,
+                                failedTracks: response.failedTracks,
+                                sourceURL: target)
                     for extra in response.files.dropFirst() {
                         history.add(name: extra.savedAs, source: .url,
                                     response: extra)

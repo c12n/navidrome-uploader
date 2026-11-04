@@ -56,6 +56,9 @@ struct HistoryView: View {
                                 }
                                 .font(.footnote)
                                 .foregroundStyle(item.scanTriggered ? .green : .secondary)
+                                if !item.failedTracks.isEmpty {
+                                    FailedTracksRow(item: item)
+                                }
                             }
                             .padding(.vertical, 2)
                         }
@@ -79,5 +82,87 @@ struct HistoryView: View {
                 }
             }
         }
+    }
+}
+
+/// The failed tracks of a URL batch, with a one-tap retry that asks
+/// the server to fetch just those tracks again (POST /tracks).
+private struct FailedTracksRow: View {
+    let item: HistoryItem
+
+    @Environment(SettingsStore.self) private var settings
+    @Environment(HistoryStore.self) private var history
+
+    @State private var isRetrying = false
+    @State private var note: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(item.failedTracks.count) track(s) didn\u{2019}t download:")
+                .font(.footnote)
+                .foregroundStyle(.orange)
+            ForEach(item.failedTracks.prefix(5), id: \.self) { track in
+                Text(track)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            if item.failedTracks.count > 5 {
+                Text("\u{2026}and \(item.failedTracks.count - 5) more")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 10) {
+                Button {
+                    Task { await retry() }
+                } label: {
+                    if isRetrying {
+                        ProgressView()
+                        Text("Retrying\u{2026}")
+                    } else {
+                        Label("Retry failed tracks",
+                              systemImage: "arrow.clockwise")
+                    }
+                }
+                .font(.footnote.bold())
+                .disabled(isRetrying)
+                if let note {
+                    Text(note)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private func retry() async {
+        isRetrying = true
+        note = nil
+        do {
+            let response = try await settings.client.retryTracks(
+                item.failedTracks,
+                enrich: settings.enrichURLs,
+                lyrics: settings.embedLyrics,
+                sort: settings.sortFolders)
+            history.add(name: response.savedAs, source: .url,
+                        response: response,
+                        failedTracks: response.failedTracks,
+                        sourceURL: item.sourceURL)
+            for extra in response.files.dropFirst() {
+                history.add(name: extra.savedAs, source: .url,
+                            response: extra)
+            }
+            // The fresh entry above carries whatever is still
+            // failing; this entry's retry offer is spent.
+            history.setFailedTracks(id: item.id, tracks: [])
+            note = response.failedTracks.isEmpty
+                ? "All caught up."
+                : "\(response.failedTracks.count) still failing."
+        } catch {
+            note = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+        }
+        isRetrying = false
     }
 }

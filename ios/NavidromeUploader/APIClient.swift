@@ -148,6 +148,45 @@ struct APIClient {
         return try decode(CheckResponse.self, data: data, response: response).results
     }
 
+    /// GET /duplicates — songs that exist more than once in the
+    /// library (same artist + title), biggest copy first per group.
+    func duplicates() async throws -> DuplicatesResponse {
+        var req = try request(for: "duplicates")
+        req.httpMethod = "GET"
+        let (data, response) = try await URLSession.shared.data(for: req)
+        return try decode(DuplicatesResponse.self, data: data, response: response)
+    }
+
+    /// POST /delete — remove library files by relative path (the
+    /// duplicate finder's cleanup).
+    func deleteFiles(_ files: [String]) async throws -> DeleteResponse {
+        var req = try request(for: "delete")
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(
+            withJSONObject: ["files": files])
+        let (data, response) = try await URLSession.shared.data(for: req)
+        return try decode(DeleteResponse.self, data: data, response: response)
+    }
+
+    /// POST /tracks — fetch specific tracks ("Artist - Title"
+    /// strings) via the server's search route. Used to retry the
+    /// failed tracks of a URL batch.
+    func retryTracks(_ tracks: [String],
+                     enrich: Bool = true,
+                     lyrics: Bool = true,
+                     sort: Bool = false) async throws -> UploadResponse {
+        var req = try request(for: "tracks")
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "tracks": tracks, "enrich": enrich, "lyrics": lyrics,
+            "sort": sort,
+        ])
+        let (data, response) = try await URLSession.shared.data(for: req)
+        return try decode(UploadResponse.self, data: data, response: response)
+    }
+
     /// GET /in-library — has Navidrome actually indexed this track?
     func inLibrary(title: String, artist: String) async throws -> InLibraryResponse {
         guard let baseURL else { throw APIError.invalidBaseURL(baseURLString) }

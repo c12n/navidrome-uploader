@@ -46,6 +46,25 @@ const List<String> kAudioExtensions = [
   'mp3', 'm4a', 'flac', 'wav', 'ogg', 'opus', 'aac', 'aif', 'aiff', 'wma',
 ];
 
+/// This build's marketing version (kept in step with pubspec.yaml;
+/// the update checker compares it against GitHub's latest release).
+const String kAppVersion = '0.4.0';
+
+/// Numeric dotted-version compare: is [candidate] newer than
+/// [current]? ("0.10.0" > "0.9.9")
+bool isNewerVersion(String candidate, String current) {
+  List<int> parts(String v) =>
+      v.split('.').map((p) => int.tryParse(p) ?? 0).toList();
+  final a = parts(candidate);
+  final b = parts(current);
+  for (var i = 0; i < a.length || i < b.length; i++) {
+    final x = i < a.length ? a[i] : 0;
+    final y = i < b.length ? b[i] : 0;
+    if (x != y) return x > y;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Small formatting helpers (no intl dependency, like the rest of the app)
 // ---------------------------------------------------------------------------
@@ -184,6 +203,11 @@ class HistoryItem {
   // True for entries merged in from the server's /recent list rather
   // than recorded by this app.
   final bool fromServer;
+  // Tracks of a URL batch that failed to download ("Artist - Title"),
+  // kept so History can offer a one-tap retry.
+  final List<String> failedTracks;
+  // The link a URL batch came from ('' for file uploads).
+  final String sourceUrl;
 
   const HistoryItem({
     required this.name,
@@ -194,7 +218,22 @@ class HistoryItem {
     required this.savedAs,
     this.folder = '',
     this.fromServer = false,
+    this.failedTracks = const [],
+    this.sourceUrl = '',
   });
+
+  HistoryItem withFailedTracks(List<String> tracks) => HistoryItem(
+        name: name,
+        source: source,
+        at: at,
+        size: size,
+        scanTriggered: scanTriggered,
+        savedAs: savedAs,
+        folder: folder,
+        fromServer: fromServer,
+        failedTracks: tracks,
+        sourceUrl: sourceUrl,
+      );
 
   Map<String, dynamic> toJson() => {
         'name': name,
@@ -204,6 +243,8 @@ class HistoryItem {
         'scanTriggered': scanTriggered,
         'savedAs': savedAs,
         'folder': folder,
+        'failedTracks': failedTracks,
+        'sourceUrl': sourceUrl,
       };
 
   factory HistoryItem.fromJson(Map<String, dynamic> j) => HistoryItem(
@@ -214,6 +255,10 @@ class HistoryItem {
         scanTriggered: j['scanTriggered'] as bool? ?? false,
         savedAs: j['savedAs'] as String? ?? (j['name'] as String? ?? ''),
         folder: j['folder'] as String? ?? '',
+        failedTracks: j['failedTracks'] is List
+            ? [for (final t in j['failedTracks'] as List) t.toString()]
+            : const [],
+        sourceUrl: j['sourceUrl'] as String? ?? '',
       );
 }
 
@@ -227,6 +272,99 @@ class LibraryStats {
     required this.uploadedTotal,
     required this.uploadedBytes,
     this.lastUploadAt,
+  });
+}
+
+/// One copy of a duplicated song (GET /duplicates).
+class DuplicateFileInfo {
+  final String file; // library-relative path
+  final int size;
+  final String title;
+  final String artist;
+  final String album;
+  final double duration;
+  const DuplicateFileInfo({
+    required this.file,
+    required this.size,
+    required this.title,
+    required this.artist,
+    required this.album,
+    required this.duration,
+  });
+  factory DuplicateFileInfo.fromJson(Map<String, dynamic> j) =>
+      DuplicateFileInfo(
+        file: j['file'] as String? ?? '',
+        size: (j['size'] as num?)?.toInt() ?? 0,
+        title: j['title'] as String? ?? '',
+        artist: j['artist'] as String? ?? '',
+        album: j['album'] as String? ?? '',
+        duration: (j['duration'] as num?)?.toDouble() ?? 0,
+      );
+}
+
+/// A song that exists more than once; files are biggest-first, so
+/// files.first is the keeper.
+class DuplicateGroupInfo {
+  final String title;
+  final String artist;
+  final List<DuplicateFileInfo> files;
+  final int wastedBytes;
+  const DuplicateGroupInfo({
+    required this.title,
+    required this.artist,
+    required this.files,
+    required this.wastedBytes,
+  });
+  factory DuplicateGroupInfo.fromJson(Map<String, dynamic> j) =>
+      DuplicateGroupInfo(
+        title: j['title'] as String? ?? '',
+        artist: j['artist'] as String? ?? '',
+        files: j['files'] is List
+            ? [
+                for (final f in j['files'] as List)
+                  DuplicateFileInfo.fromJson(f as Map<String, dynamic>)
+              ]
+            : const [],
+        wastedBytes: (j['wasted_bytes'] as num?)?.toInt() ?? 0,
+      );
+}
+
+class DuplicatesResult {
+  final List<DuplicateGroupInfo> groups;
+  final int groupCount;
+  final int fileCount;
+  final int wastedBytes;
+  final int scanned;
+  const DuplicatesResult({
+    required this.groups,
+    required this.groupCount,
+    required this.fileCount,
+    required this.wastedBytes,
+    required this.scanned,
+  });
+  factory DuplicatesResult.fromJson(Map<String, dynamic> j) =>
+      DuplicatesResult(
+        groups: j['groups'] is List
+            ? [
+                for (final g in j['groups'] as List)
+                  DuplicateGroupInfo.fromJson(g as Map<String, dynamic>)
+              ]
+            : const [],
+        groupCount: (j['group_count'] as num?)?.toInt() ?? 0,
+        fileCount: (j['file_count'] as num?)?.toInt() ?? 0,
+        wastedBytes: (j['wasted_bytes'] as num?)?.toInt() ?? 0,
+        scanned: (j['scanned'] as num?)?.toInt() ?? 0,
+      );
+}
+
+class DeleteFilesResult {
+  final List<String> deleted;
+  final int errorCount;
+  final bool scanTriggered;
+  const DeleteFilesResult({
+    required this.deleted,
+    required this.errorCount,
+    required this.scanTriggered,
   });
 }
 
@@ -343,6 +481,7 @@ class AppState extends ChangeNotifier {
     booted = true;
     notifyListeners();
     unawaited(testConnection());
+    unawaited(checkForUpdate());
   }
 
   Future<void> setServerUrl(String url) async {
@@ -452,6 +591,78 @@ class AppState extends ChangeNotifier {
     history = [];
     notifyListeners();
     unawaited(_saveHistory());
+  }
+
+  /// After a retry, replace one entry's still-failed track list (an
+  /// empty list clears the retry offer).
+  void replaceHistoryFailedTracks(HistoryItem old, List<String> remaining) {
+    final i = history.indexOf(old);
+    if (i < 0) return;
+    final copy = [...history];
+    copy[i] = old.withFailedTracks(remaining);
+    history = copy;
+    notifyListeners();
+    unawaited(_saveHistory());
+  }
+
+  // --- Update checker -------------------------------------------------
+  // GitHub's latest release vs this build, checked at most every 6
+  // hours; the Upload page shows a small banner when one is newer.
+  String? updateVersion;
+  String? updateUrl;
+  String? _dismissedUpdate;
+
+  Future<void> checkForUpdate() async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    _dismissedUpdate = prefs.getString('update.dismissedVersion');
+    final lastMs = prefs.getInt('update.lastCheck') ?? 0;
+    final stale = DateTime.now().millisecondsSinceEpoch - lastMs >
+        6 * 3600 * 1000;
+    if (stale) {
+      await prefs.setInt(
+          'update.lastCheck', DateTime.now().millisecondsSinceEpoch);
+      try {
+        final r = await http.get(
+          Uri.parse(
+              'https://api.github.com/repos/c12n/navidrome-uploader/releases/latest'),
+          headers: const {'Accept': 'application/vnd.github+json'},
+        );
+        if (r.statusCode == 200) {
+          final j = jsonDecode(r.body) as Map<String, dynamic>;
+          var tag = (j['tag_name'] as String? ?? '');
+          if (tag.startsWith('v')) tag = tag.substring(1);
+          await prefs.setString('update.cachedVersion', tag);
+          await prefs.setString(
+              'update.cachedUrl', j['html_url'] as String? ?? '');
+        }
+      } catch (_) {
+        // Offline or blocked: keep whatever was cached.
+      }
+    }
+    final cached = prefs.getString('update.cachedVersion');
+    final cachedUrl = prefs.getString('update.cachedUrl');
+    if (cached != null &&
+        cachedUrl != null &&
+        cached != _dismissedUpdate &&
+        isNewerVersion(cached, kAppVersion)) {
+      updateVersion = cached;
+      updateUrl = cachedUrl;
+    } else {
+      updateVersion = null;
+      updateUrl = null;
+    }
+    notifyListeners();
+  }
+
+  Future<void> dismissUpdate() async {
+    if (updateVersion != null) {
+      _dismissedUpdate = updateVersion;
+      await _prefs?.setString('update.dismissedVersion', updateVersion!);
+    }
+    updateVersion = null;
+    updateUrl = null;
+    notifyListeners();
   }
 
   Future<void> testConnection() async {
@@ -837,6 +1048,81 @@ class NaviApi {
 
   /// The server's own upload log (newest first), as history entries
   /// flagged fromServer so the History page can chip them.
+  /// GET /duplicates — songs that exist more than once in the
+  /// library (same artist + title), biggest copy first per group.
+  Future<DuplicatesResult> fetchDuplicates() async {
+    final http.Response r;
+    try {
+      r = await http.get(_uri('/duplicates'), headers: _authHeaders);
+    } catch (e) {
+      throw ApiException('Could not reach the server: $e');
+    }
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    return DuplicatesResult.fromJson(
+        jsonDecode(r.body) as Map<String, dynamic>);
+  }
+
+  /// POST /delete — remove library files by relative path (the
+  /// duplicate finder's cleanup).
+  Future<DeleteFilesResult> deleteFiles(List<String> files) async {
+    final http.Response r;
+    try {
+      r = await http.post(
+        _uri('/delete'),
+        headers: {
+          'Content-Type': 'application/json',
+          ..._authHeaders,
+        },
+        body: jsonEncode({'files': files}),
+      );
+    } catch (e) {
+      throw ApiException('Could not reach the server: $e');
+    }
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    final j = jsonDecode(r.body) as Map<String, dynamic>;
+    return DeleteFilesResult(
+      deleted: j['deleted'] is List
+          ? [for (final f in j['deleted'] as List) f.toString()]
+          : const [],
+      errorCount: j['errors'] is List ? (j['errors'] as List).length : 0,
+      scanTriggered: j['scan_triggered'] as bool? ?? false,
+    );
+  }
+
+  /// POST /tracks — fetch specific tracks ("Artist - Title") via
+  /// the server's search route; retries a batch's failed tracks.
+  Future<UploadResult> retryTracks(
+    List<String> tracks, {
+    bool enrich = true,
+    bool lyrics = true,
+    bool sort = false,
+  }) async {
+    final http.Response r;
+    try {
+      r = await http.post(
+        _uri('/tracks'),
+        headers: {
+          'Content-Type': 'application/json',
+          ..._authHeaders,
+          ..._debridHeaders,
+        },
+        body: jsonEncode({
+          'tracks': tracks,
+          'enrich': enrich,
+          'lyrics': lyrics,
+          'sort': sort,
+        }),
+      );
+    } catch (e) {
+      throw ApiException('Could not reach the server: $e');
+    }
+    return _parseUpload(r);
+  }
+
   Future<List<HistoryItem>> fetchRecent() async {
     final http.Response r;
     try {
@@ -1692,6 +1978,34 @@ class _UploadPageState extends State<UploadPage> {
       padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
       children: [
         const _SectionHeader('Upload files'),
+        if (appState.updateVersion != null) ...[
+          Card(
+            color: scheme.primaryContainer,
+            child: ListTile(
+              leading: Icon(Icons.system_update,
+                  color: scheme.onPrimaryContainer),
+              title: Text(
+                  'NaviUpload ${appState.updateVersion} is available'),
+              subtitle: const Text(
+                  'Get the new build from the GitHub release page. '
+                  'Click to copy the link.'),
+              trailing: IconButton(
+                icon: const Icon(Icons.close),
+                tooltip: 'Dismiss',
+                onPressed: () => appState.dismissUpdate(),
+              ),
+              onTap: () async {
+                await Clipboard.setData(
+                    ClipboardData(text: appState.updateUrl ?? ''));
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      content: Text('Release page link copied.')));
+                }
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
         _statsCard(context),
         const SizedBox(height: 8),
         DropTarget(
@@ -1870,6 +2184,7 @@ class _UrlPageState extends State<UrlPage> {
   /// the server returned a list (playlists, ZIPs), else the single
   /// result itself.
   void _recordHistory(String url, UploadResult res) {
+    var first = true;
     void addOne(String savedAs, int size, bool scan) {
       appState.addHistory(HistoryItem(
         name: savedAs.isNotEmpty ? savedAs : url,
@@ -1879,7 +2194,12 @@ class _UrlPageState extends State<UrlPage> {
         scanTriggered: scan,
         savedAs: savedAs,
         folder: res.folder,
+        // The batch's failed tracks ride on its first entry, so
+        // History can offer a retry for just those.
+        failedTracks: first ? res.failedTracks : const [],
+        sourceUrl: first ? url : '',
       ));
+      first = false;
     }
 
     if (res.files.isNotEmpty) {
@@ -2091,6 +2411,54 @@ class _HistoryPageState extends State<HistoryPage> {
   // created and merged into the display in memory (local history
   // storage stays exactly as it was).
   List<HistoryItem> _serverEntries = [];
+  bool _retryBusy = false;
+
+  /// Ask the server to fetch just this entry's failed tracks again,
+  /// record what landed, and shrink the entry's failed list to
+  /// whatever is still missing.
+  Future<void> _retryFailed(HistoryItem h) async {
+    if (_retryBusy) return;
+    setState(() => _retryBusy = true);
+    try {
+      final res = await appState.api.retryTracks(
+        h.failedTracks,
+        enrich: appState.enrichURLs,
+        lyrics: appState.embedLyrics,
+        sort: appState.sortFolders,
+      );
+      final saved = res.files.isNotEmpty ? res.files : [res];
+      for (final f in saved) {
+        appState.addHistory(HistoryItem(
+          name: f.savedAs.isNotEmpty ? f.savedAs : 'Retried track',
+          source: 'URL',
+          at: DateTime.now(),
+          size: f.size,
+          scanTriggered: f.scanTriggered,
+          savedAs: f.savedAs,
+          folder: f.folder,
+          failedTracks: f == saved.first ? res.failedTracks : const [],
+          sourceUrl: h.sourceUrl,
+        ));
+      }
+      // The fresh first entry above carries whatever is still
+      // failing; this entry's retry offer is spent.
+      appState.replaceHistoryFailedTracks(h, const []);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(res.failedTracks.isEmpty
+              ? 'All failed tracks downloaded.'
+              : '${res.failedTracks.length} track(s) still failing.'),
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    } finally {
+      if (mounted) setState(() => _retryBusy = false);
+    }
+  }
 
   @override
   void initState() {
@@ -2194,7 +2562,10 @@ class _HistoryPageState extends State<HistoryPage> {
         else
           for (final h in items)
             Card(
-              child: ListTile(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  ListTile(
                 leading: Icon(
                   h.source == 'URL' ? Icons.link : Icons.music_note,
                   size: 30,
@@ -2226,6 +2597,33 @@ class _HistoryPageState extends State<HistoryPage> {
                   ].join(' · '),
                   style: theme.textTheme.bodyMedium,
                 ),
+                  ),
+                  if (h.failedTracks.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 12, 10),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '${h.failedTracks.length} track'
+                              '${h.failedTracks.length == 1 ? '' : 's'} '
+                              "didn't download: "
+                              '${h.failedTracks.take(3).join(', ')}'
+                              '${h.failedTracks.length > 3 ? '…' : ''}',
+                              style: theme.textTheme.bodyMedium
+                                  ?.copyWith(color: scheme.error),
+                            ),
+                          ),
+                          TextButton.icon(
+                            onPressed:
+                                _retryBusy ? null : () => _retryFailed(h),
+                            icon: const Icon(Icons.refresh, size: 18),
+                            label: Text(_retryBusy ? 'Retrying…' : 'Retry'),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
               ),
             ),
       ],
@@ -2250,6 +2648,87 @@ class _SettingsPageState extends State<SettingsPage> {
   final TextEditingController _torboxCtrl = TextEditingController();
   final TextEditingController _premiumizeCtrl = TextEditingController();
   bool _synced = false;
+  String? _backupNote;
+
+  /// Write the keys backup JSON (same shape as the iOS app's) to a
+  /// file the user picks.
+  Future<void> _exportKeys() async {
+    final backup = <String, dynamic>{
+      'app': 'NaviUpload',
+      'version': 1,
+      'server': appState.serverUrl,
+      'token': appState.token ?? '',
+      'torbox_key': appState.torboxKey ?? '',
+      'premiumize_key': appState.premiumizeKey ?? '',
+    };
+    final bytes =
+        utf8.encode(const JsonEncoder.withIndent('  ').convert(backup));
+    try {
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save NaviUpload keys backup',
+        fileName: 'NaviUpload-Keys.json',
+        type: FileType.custom,
+        allowedExtensions: const ['json'],
+        bytes: bytes,
+      );
+      if (path == null) return; // user cancelled
+      // Some platform versions return a path without writing when
+      // bytes are passed — write it ourselves to be sure.
+      await File(path).writeAsBytes(bytes, flush: true);
+      setState(() => _backupNote = 'Keys exported to $path');
+    } catch (e) {
+      setState(() => _backupNote = 'Export failed: $e');
+    }
+  }
+
+  /// Read a keys backup JSON back in and apply what it carries.
+  Future<void> _importKeys() async {
+    try {
+      final picked = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['json'],
+        withData: true,
+      );
+      final file = (picked == null || picked.files.isEmpty)
+          ? null
+          : picked.files.single;
+      if (file == null) return; // user cancelled
+      var bytes = file.bytes;
+      if (bytes == null && file.path != null) {
+        bytes = await File(file.path!).readAsBytes();
+      }
+      if (bytes == null) {
+        setState(() => _backupNote = 'Could not read that file.');
+        return;
+      }
+      final decoded = jsonDecode(utf8.decode(bytes));
+      if (decoded is! Map || decoded['app'] != 'NaviUpload') {
+        setState(() =>
+            _backupNote = 'That file is not a NaviUpload keys backup.');
+        return;
+      }
+      String field(String key) => (decoded[key] as String? ?? '').trim();
+      if (field('server').isNotEmpty) {
+        await appState.setServerUrl(field('server'));
+      }
+      if (field('token').isNotEmpty) {
+        await appState.setToken(field('token'));
+      }
+      if (field('torbox_key').isNotEmpty) {
+        await appState.setTorboxKey(field('torbox_key'));
+      }
+      if (field('premiumize_key').isNotEmpty) {
+        await appState.setPremiumizeKey(field('premiumize_key'));
+      }
+      await _syncFromState();
+      setState(() => _backupNote =
+          'Keys imported — use Test connection to confirm.');
+    } catch (_) {
+      setState(() => _backupNote =
+          'Could not read that file — it is not a valid NaviUpload '
+          'JSON backup.');
+    }
+  }
 
   @override
   void initState() {
@@ -2549,6 +3028,62 @@ class _SettingsPageState extends State<SettingsPage> {
             },
           ),
         ),
+        const _SectionHeader('Library'),
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.copy_all_outlined),
+            title: const Text('Find duplicate songs'),
+            subtitle: const Text(
+                'Songs that exist more than once, and the space the '
+                'extra copies waste. Delete extras from inside the app.'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                  builder: (_) => const DuplicatesPage()),
+            ),
+          ),
+        ),
+        const _SectionHeader('Backup'),
+        Card(
+          child: Column(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.upload_file_outlined),
+                title: const Text('Export keys as JSON'),
+                subtitle: const Text(
+                    'One file with your server, upload token and both '
+                    'debrid keys — the same file works in the iOS app.'),
+                onTap: _exportKeys,
+              ),
+              ListTile(
+                leading: const Icon(Icons.download_outlined),
+                title: const Text('Import keys from JSON'),
+                subtitle: const Text(
+                    'Fill in whatever a backup file carries; the rest '
+                    'stays as-is.'),
+                onTap: _importKeys,
+              ),
+              if (_backupNote != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(_backupNote!,
+                        style: theme.textTheme.bodyMedium),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(
+            'The backup file contains your keys — treat it like a '
+            'password.',
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ),
         const _SectionHeader('Appearance'),
         SegmentedButton<int>(
           segments: const [
@@ -2584,7 +3119,8 @@ class _SettingsPageState extends State<SettingsPage> {
         Card(
           child: ListTile(
             leading: const AppIconBadge(size: 40),
-            title: Text('NaviUpload 0.2.0', style: theme.textTheme.titleMedium),
+            title:
+                Text('NaviUpload $kAppVersion', style: theme.textTheme.titleMedium),
             subtitle: Text(
               'Upload music to your Navidrome library from files or '
               'URLs.',
@@ -2593,6 +3129,215 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ),
       ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate finder page: songs that exist more than once in the
+// library (server GET /duplicates), with per-copy delete (POST
+// /delete). The biggest copy of each song is marked as the keeper;
+// deleting is always confirmed first.
+// ---------------------------------------------------------------------------
+
+class DuplicatesPage extends StatefulWidget {
+  const DuplicatesPage({super.key});
+
+  @override
+  State<DuplicatesPage> createState() => _DuplicatesPageState();
+}
+
+class _DuplicatesPageState extends State<DuplicatesPage> {
+  DuplicatesResult? _result;
+  bool _loading = true;
+  bool _deleting = false;
+  String? _error;
+  String? _note;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final r = await appState.api.fetchDuplicates();
+      if (mounted) {
+        setState(() {
+          _result = r;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = e.toString();
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _confirmDelete(List<DuplicateFileInfo> files) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(files.length == 1
+            ? 'Delete this copy?'
+            : 'Delete ${files.length} copies?'),
+        content: const Text(
+            'This removes the file from your server for good. The '
+            'biggest copy of each song is kept.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _deleting = true);
+    try {
+      final res =
+          await appState.api.deleteFiles([for (final f in files) f.file]);
+      _note = res.errorCount == 0
+          ? 'Deleted ${res.deleted.length} file(s).'
+          : 'Deleted ${res.deleted.length}; ${res.errorCount} could '
+              'not be deleted.';
+      await _load();
+    } catch (e) {
+      _note = e.toString();
+    }
+    if (mounted) setState(() => _deleting = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Duplicate songs')),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _error != null
+              ? Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('Could not scan the library',
+                          style: theme.textTheme.titleLarge),
+                      const SizedBox(height: 8),
+                      Text(_error!,
+                          style: theme.textTheme.bodyMedium
+                              ?.copyWith(color: scheme.error)),
+                      const SizedBox(height: 16),
+                      FilledButton.tonal(
+                          onPressed: _load, child: const Text('Retry')),
+                    ],
+                  ),
+                )
+              : _result == null || _result!.groups.isEmpty
+                  ? Center(
+                      child: Text(
+                        'No duplicates — every song in your library '
+                        'exists exactly once.',
+                        style: theme.textTheme.titleMedium,
+                      ),
+                    )
+                  : ListView(
+                      padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+                      children: [
+                        Text(
+                          '${_result!.groupCount} songs are duplicated '
+                          '(${_result!.fileCount} files) · '
+                          '${formatBytes(_result!.wastedBytes)} wasted',
+                          style: theme.textTheme.bodyLarge?.copyWith(
+                              color: scheme.onSurfaceVariant),
+                        ),
+                        if (_note != null) ...[
+                          const SizedBox(height: 8),
+                          Text(_note!, style: theme.textTheme.bodyMedium),
+                        ],
+                        const SizedBox(height: 12),
+                        for (final g in _result!.groups)
+                          Card(
+                            margin: const EdgeInsets.only(bottom: 12),
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(
+                                  16, 12, 16, 8),
+                              child: Column(
+                                crossAxisAlignment:
+                                    CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    g.artist.isEmpty
+                                        ? g.title
+                                        : '${g.artist} — ${g.title}',
+                                    style: theme.textTheme.titleMedium,
+                                  ),
+                                  const SizedBox(height: 6),
+                                  for (var i = 0; i < g.files.length; i++)
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: Text(
+                                            '${g.files[i].file}  ·  '
+                                            '${formatBytes(g.files[i].size)}',
+                                            style:
+                                                theme.textTheme.bodyMedium,
+                                          ),
+                                        ),
+                                        if (i == 0)
+                                          Text(
+                                            'Keep',
+                                            style: theme
+                                                .textTheme.bodyMedium
+                                                ?.copyWith(
+                                                    color: Colors.green,
+                                                    fontWeight:
+                                                        FontWeight.bold),
+                                          )
+                                        else
+                                          TextButton(
+                                            onPressed: _deleting
+                                                ? null
+                                                : () => _confirmDelete(
+                                                    [g.files[i]]),
+                                            child: const Text('Delete'),
+                                          ),
+                                      ],
+                                    ),
+                                  if (g.files.length > 2)
+                                    Align(
+                                      alignment: Alignment.centerRight,
+                                      child: TextButton.icon(
+                                        onPressed: _deleting
+                                            ? null
+                                            : () => _confirmDelete(
+                                                g.files.sublist(1)),
+                                        icon: const Icon(
+                                            Icons.delete_sweep_outlined,
+                                            size: 18),
+                                        label: const Text(
+                                            'Delete extra copies'),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
     );
   }
 }

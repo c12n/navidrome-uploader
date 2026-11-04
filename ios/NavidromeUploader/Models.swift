@@ -255,9 +255,15 @@ struct HistoryItem: Codable, Identifiable, Equatable {
     var size: Int               // bytes, 0 when the server did not say
     var folder: String = ""     // Artist/Album when filed into folders
     var fromServer: Bool = false // merged in from the server's own log
+    /// Tracks of a URL batch that failed to download ("Artist - Title"
+    /// strings), kept so History can offer a one-tap retry.
+    var failedTracks: [String] = []
+    /// The link a URL batch came from ("" for file uploads).
+    var sourceURL: String = ""
 
     enum CodingKeys: String, CodingKey {
         case id, name, source, date, scanTriggered, size, folder, fromServer
+        case failedTracks, sourceURL
     }
 
     // Lenient decode so history saved by older versions still loads.
@@ -271,11 +277,14 @@ struct HistoryItem: Codable, Identifiable, Equatable {
         size = (try? c.decodeIfPresent(Int.self, forKey: .size)) ?? nil ?? 0
         folder = (try? c.decodeIfPresent(String.self, forKey: .folder)) ?? nil ?? ""
         fromServer = (try? c.decodeIfPresent(Bool.self, forKey: .fromServer)) ?? nil ?? false
+        failedTracks = (try? c.decodeIfPresent([String].self, forKey: .failedTracks)) ?? nil ?? []
+        sourceURL = (try? c.decodeIfPresent(String.self, forKey: .sourceURL)) ?? nil ?? ""
     }
 
     init(id: UUID = UUID(), name: String, source: UploadSource, date: Date,
          scanTriggered: Bool, size: Int, folder: String = "",
-         fromServer: Bool = false) {
+         fromServer: Bool = false, failedTracks: [String] = [],
+         sourceURL: String = "") {
         self.id = id
         self.name = name
         self.source = source
@@ -284,6 +293,8 @@ struct HistoryItem: Codable, Identifiable, Equatable {
         self.size = size
         self.folder = folder
         self.fromServer = fromServer
+        self.failedTracks = failedTracks
+        self.sourceURL = sourceURL
     }
 }
 
@@ -409,16 +420,27 @@ final class HistoryStore {
         }
     }
 
-    func add(name: String, source: UploadSource, response: UploadResponse) {
+    func add(name: String, source: UploadSource, response: UploadResponse,
+             failedTracks: [String] = [], sourceURL: String = "") {
         let item = HistoryItem(
             name: response.savedAs.isEmpty ? name : response.savedAs,
             source: source,
             date: Date(),
             scanTriggered: response.scanTriggered,
             size: response.size,
-            folder: response.folder
+            folder: response.folder,
+            failedTracks: failedTracks,
+            sourceURL: sourceURL
         )
         items.insert(item, at: 0)
+        persist()
+    }
+
+    /// After a retry, replace an entry's still-failed track list (an
+    /// empty list clears the retry offer).
+    func setFailedTracks(id: UUID, tracks: [String]) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].failedTracks = tracks
         persist()
     }
 
@@ -465,5 +487,193 @@ final class HistoryStore {
         if let data = try? JSONEncoder().encode(items) {
             UserDefaults.standard.set(data, forKey: Self.storageKey)
         }
+    }
+}
+
+// MARK: - Duplicate finder (GET /duplicates, POST /delete)
+
+struct DuplicateFile: Decodable, Equatable {
+    let file: String          // library-relative path
+    let size: Int
+    let title: String
+    let artist: String
+    let album: String
+    let duration: Double
+}
+
+struct DuplicateGroup: Decodable, Equatable {
+    let title: String
+    let artist: String
+    let files: [DuplicateFile]   // biggest copy first — the keeper
+    let wastedBytes: Int
+
+    enum CodingKeys: String, CodingKey {
+        case title, artist, files
+        case wastedBytes = "wasted_bytes"
+    }
+}
+
+struct DuplicatesResponse: Decodable {
+    let groups: [DuplicateGroup]
+    let groupCount: Int
+    let fileCount: Int
+    let wastedBytes: Int
+    let scanned: Int
+
+    enum CodingKeys: String, CodingKey {
+        case groups, scanned
+        case groupCount = "group_count"
+        case fileCount = "file_count"
+        case wastedBytes = "wasted_bytes"
+    }
+}
+
+struct DeleteResponse: Decodable {
+    struct DeleteError: Decodable {
+        let file: String
+        let error: String
+    }
+    let deleted: [String]
+    let errors: [DeleteError]
+    let scanTriggered: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case deleted, errors
+        case scanTriggered = "scan_triggered"
+    }
+}
+
+// MARK: - Keys backup (JSON export / import)
+
+/// Everything needed to set the app up on another device: server,
+/// upload token and both debrid keys. Exported as a JSON file from
+/// Settings and imported back the same way. The file contains
+/// secrets — the UI says so wherever it's offered.
+struct KeysBackup: Codable {
+    var app: String = "NaviUpload"
+    var version: Int = 1
+    var server: String
+    var token: String
+    var torboxKey: String
+    var premiumizeKey: String
+
+    enum CodingKeys: String, CodingKey {
+        case app, version, server, token
+        case torboxKey = "torbox_key"
+        case premiumizeKey = "premiumize_key"
+    }
+
+    init(server: String, token: String, torboxKey: String,
+         premiumizeKey: String) {
+        self.server = server
+        self.token = token
+        self.torboxKey = torboxKey
+        self.premiumizeKey = premiumizeKey
+    }
+
+    // Lenient: fields a future version adds (or leaves out) must not
+    // break an import.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        app = (try? c.decodeIfPresent(String.self, forKey: .app)) ?? nil ?? "NaviUpload"
+        version = (try? c.decodeIfPresent(Int.self, forKey: .version)) ?? nil ?? 1
+        server = (try? c.decodeIfPresent(String.self, forKey: .server)) ?? nil ?? ""
+        token = (try? c.decodeIfPresent(String.self, forKey: .token)) ?? nil ?? ""
+        torboxKey = (try? c.decodeIfPresent(String.self, forKey: .torboxKey)) ?? nil ?? ""
+        premiumizeKey = (try? c.decodeIfPresent(String.self, forKey: .premiumizeKey)) ?? nil ?? ""
+    }
+}
+
+extension SettingsStore {
+    /// Snapshot of the current setup for the JSON backup file.
+    func makeBackup() -> KeysBackup {
+        KeysBackup(
+            server: baseURLString
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            token: token.trimmingCharacters(in: .whitespacesAndNewlines),
+            torboxKey: torboxKey
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            premiumizeKey: premiumizeKey
+                .trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Apply an imported backup. Empty fields in the file leave the
+    /// current values alone, except the server, which only applies
+    /// when the file actually carries one.
+    func applyBackup(_ backup: KeysBackup) {
+        if !backup.server.isEmpty { baseURLString = backup.server }
+        if !backup.token.isEmpty { token = backup.token }
+        if !backup.torboxKey.isEmpty { torboxKey = backup.torboxKey }
+        if !backup.premiumizeKey.isEmpty {
+            premiumizeKey = backup.premiumizeKey
+        }
+    }
+
+    /// The backup as pretty JSON data for the export file.
+    func backupJSONData() -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? encoder.encode(makeBackup())
+    }
+}
+
+// MARK: - Update checker
+
+/// A newer NaviUpload release spotted on GitHub.
+struct AvailableUpdate: Equatable {
+    let version: String       // "0.5.0" (no leading v)
+    let pageURL: URL
+}
+
+/// Asks GitHub for the latest release of c12n/navidrome-uploader at
+/// most every 6 hours and caches the answer, so the Upload tab can
+/// show a small "update available" banner. Purely informational —
+/// installing still happens through the usual sideload route.
+enum UpdateChecker {
+    private static let apiURL = URL(
+        string: "https://api.github.com/repos/c12n/navidrome-uploader/releases/latest")!
+    private static let lastCheckKey = "update.lastCheck"
+    private static let cachedVersionKey = "update.cachedVersion"
+    private static let cachedURLKey = "update.cachedURL"
+
+    static var currentVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "0"
+    }
+
+    /// The cached or freshly fetched update, if one is newer than
+    /// the running app.
+    static func availableUpdate() async -> AvailableUpdate? {
+        let defaults = UserDefaults.standard
+        let last = defaults.object(forKey: lastCheckKey) as? Date
+        if last == nil || Date().timeIntervalSince(last!) > 6 * 3600 {
+            defaults.set(Date(), forKey: lastCheckKey)
+            if let (data, _) = try? await URLSession.shared.data(from: apiURL),
+               let json = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+               let tag = json["tag_name"] as? String,
+               let page = json["html_url"] as? String {
+                let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+                defaults.set(version, forKey: cachedVersionKey)
+                defaults.set(page, forKey: cachedURLKey)
+            }
+        }
+        guard let version = defaults.string(forKey: cachedVersionKey),
+              let page = defaults.string(forKey: cachedURLKey),
+              let url = URL(string: page),
+              isNewer(version, than: currentVersion) else { return nil }
+        return AvailableUpdate(version: version, pageURL: url)
+    }
+
+    /// Numeric dotted-version compare ("0.10.0" > "0.9.9").
+    static func isNewer(_ candidate: String, than current: String) -> Bool {
+        let a = candidate.split(separator: ".").map { Int($0) ?? 0 }
+        let b = current.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0
+            let y = i < b.count ? b[i] : 0
+            if x != y { return x > y }
+        }
+        return false
     }
 }

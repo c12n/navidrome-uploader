@@ -539,8 +539,8 @@ async def _identify_musicbrainz(title: str, artist: str) -> dict | None:
     return None
 
 
-async def _fetch_lyrics(title: str, artist: str,
-                        duration: float) -> str | None:
+async def _fetch_lyrics_lrclib(title: str, artist: str,
+                               duration: float) -> str | None:
     """Plain lyrics from LRCLIB (no key needed). When only the synced
     version exists, its timestamps are stripped."""
     if not title:
@@ -570,6 +570,49 @@ async def _fetch_lyrics(title: str, artist: str,
     except Exception:
         return None
     return None
+
+
+def _fetch_lyrics_fallback(title: str, artist: str) -> str | None:
+    """Second lyrics source: the syncedlyrics aggregator (Musixmatch,
+    then Genius) for songs LRCLIB simply doesn't have. Optional
+    dependency — absent or failing means no fallback, never an error.
+    Synced timestamps and LRC metadata tags are stripped."""
+    try:
+        import syncedlyrics
+    except Exception:
+        return None
+    query = f"{artist} - {title}".strip(" -") if artist else title
+    try:
+        raw = syncedlyrics.search(query,
+                                  providers=["musixmatch", "genius"])
+    except Exception:
+        return None
+    if not raw:
+        return None
+    lines = []
+    for line in str(raw).splitlines():
+        line = re.sub(r"\[\d+:\d+(?:\.\d+)?\]\s?", "", line).strip()
+        if not line or (line.startswith("[") and line.endswith("]")):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip() or None
+
+
+async def _fetch_lyrics(title: str, artist: str,
+                        duration: float) -> str | None:
+    """Lyrics for a track: LRCLIB first (exact and fast), then the
+    syncedlyrics fallback for songs LRCLIB doesn't carry."""
+    text = await _fetch_lyrics_lrclib(title, artist, duration)
+    if text:
+        return text
+    if not title:
+        return None
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_fetch_lyrics_fallback, title, artist),
+            timeout=45)
+    except Exception:
+        return None
 
 
 async def enrich_file(path: str, want_meta: bool, want_lyrics: bool,
@@ -1444,6 +1487,174 @@ async def in_library(title: str = "", artist: str = "",
             return {"configured": True, "found": True,
                     "matched_title": s.get("title")}
     return {"configured": True, "found": False, "matched_title": None}
+
+
+@app.post("/tracks")
+async def upload_tracks(
+    request: Request,
+    x_upload_token: str | None = Header(default=None),
+) -> dict:
+    """Fetch specific tracks ({title, artist}, or "Artist - Title"
+    strings) via yt-dlp search. The apps use this to retry just the
+    failed tracks of a Spotify / playlist batch instead of
+    re-downloading the whole link."""
+    require_token(x_upload_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Body must be JSON: {\"tracks\": [...]}")
+    raw = (body or {}).get("tracks") or []
+    want_meta = _flag(body.get("enrich", True))
+    want_lyrics = _flag(body.get("lyrics", True))
+    want_sort = _flag(body.get("sort", False))
+    tracks = []
+    for item in raw[:50]:
+        if isinstance(item, str):
+            artist, sep, title = item.partition(" - ")
+            if not sep:
+                artist, title = "", item
+            tracks.append({"title": title.strip(),
+                           "artist": artist.strip()})
+        elif isinstance(item, dict):
+            tracks.append({
+                "title": str(item.get("title") or "").strip(),
+                "artist": str(item.get("artist") or "").strip()})
+    tracks = [t for t in tracks if t["title"]]
+    if not tracks:
+        raise HTTPException(400, "Give at least one track to fetch")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    workdir = tempfile.mkdtemp(dir=DATA_DIR)
+    try:
+        saved, failed = [], []
+        for i, track in enumerate(tracks):
+            try:
+                local = await asyncio.to_thread(
+                    fetch_spotify_audio, track, workdir, i)
+            except HTTPException:
+                failed.append(
+                    f"{track['artist']} - {track['title']}".strip(" -"))
+                continue
+            fname = sanitize_filename(
+                f"{track['artist']} - {track['title']}.mp3")
+            saved.append(await save_processed(
+                local, fname, "url", want_meta, want_lyrics, want_sort,
+                known=track))
+        if not saved:
+            raise HTTPException(
+                502, "None of the tracks could be downloaded")
+        first = saved[0]
+        first["via"] = "retry"
+        if len(saved) > 1:
+            first["also_saved"] = len(saved) - 1
+            first["files"] = [dict(e) for e in saved]
+        if failed:
+            first["failed_tracks"] = failed
+        return first
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _dup_key_part(text: str) -> str:
+    """Normalise a title/artist for duplicate matching: lowercase,
+    drop bracketed extras ((feat. ...), [Remaster] ...), keep only
+    letters and digits."""
+    text = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", (text or "").lower())
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def find_duplicates() -> dict:
+    """Group library files that are the same song (same normalised
+    artist + title tags; untagged files match on filename)."""
+    groups: dict[str, list] = {}
+    scanned = 0
+    for root, _dirs, files in os.walk(LIBRARY_DIR):
+        for name in files:
+            if os.path.splitext(name)[1].lower() not in AUDIO_EXTS:
+                continue
+            path = os.path.join(root, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            scanned += 1
+            tags = read_tags(path)
+            title = tags["title"] or os.path.splitext(name)[0]
+            key = (_dup_key_part(tags["artist"]) + "|"
+                   + _dup_key_part(title))
+            if key == "|":
+                continue
+            groups.setdefault(key, []).append({
+                "file": os.path.relpath(path, LIBRARY_DIR),
+                "size": size,
+                "title": title,
+                "artist": tags["artist"],
+                "album": tags["album"],
+                "duration": round(tags["duration"], 1),
+            })
+    dupes, wasted = [], 0
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        # Biggest copy first: that's the one to keep.
+        items.sort(key=lambda i: i["size"], reverse=True)
+        extra = sum(i["size"] for i in items[1:])
+        wasted += extra
+        dupes.append({"title": items[0]["title"],
+                      "artist": items[0]["artist"],
+                      "files": items,
+                      "wasted_bytes": extra})
+    dupes.sort(key=lambda d: d["wasted_bytes"], reverse=True)
+    return {"groups": dupes,
+            "group_count": len(dupes),
+            "file_count": sum(len(d["files"]) for d in dupes),
+            "wasted_bytes": wasted,
+            "scanned": scanned}
+
+
+@app.get("/duplicates")
+async def duplicates(
+        x_upload_token: str | None = Header(default=None)) -> dict:
+    """Every song that exists more than once in the library, with the
+    copies (biggest first) and the space the extra copies waste."""
+    require_token(x_upload_token)
+    # Tag-reading thousands of files is slow, sync work: thread it.
+    return await asyncio.to_thread(find_duplicates)
+
+
+@app.post("/delete")
+async def delete_files(
+        request: Request,
+        x_upload_token: str | None = Header(default=None)) -> dict:
+    """Delete library files by library-relative path (the duplicate
+    finder's cleanup). Paths are pinned inside the library and must
+    be audio files; anything else is reported, never touched."""
+    require_token(x_upload_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Body must be JSON: {\"files\": [...]}")
+    wanted = (body or {}).get("files") or []
+    base = os.path.realpath(LIBRARY_DIR)
+    deleted, errors = [], []
+    for rel in wanted[:200]:
+        rel = str(rel or "")
+        path = os.path.realpath(os.path.join(base, rel))
+        if (not path.startswith(base + os.sep)
+                or os.path.splitext(path)[1].lower() not in AUDIO_EXTS):
+            errors.append({"file": rel,
+                           "error": "not a library audio file"})
+            continue
+        try:
+            os.unlink(path)
+            deleted.append(rel)
+        except OSError as exc:
+            errors.append({"file": rel, "error": str(exc)})
+    scan_triggered = False
+    if deleted and NAVIDROME_URL and NAVIDROME_USER and NAVIDROME_PASSWORD:
+        scan_triggered = await trigger_scan()
+    return {"deleted": deleted, "errors": errors,
+            "scan_triggered": scan_triggered}
 
 
 @app.exception_handler(HTTPException)
