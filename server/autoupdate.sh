@@ -92,6 +92,7 @@ for pair in pairs:
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
 with os.fdopen(fd, "w") as fh:
     json.dump(data, fh, indent=1, sort_keys=True)
+os.chmod(tmp, 0o644)  # mkstemp makes it 0600; the status should stay readable
 os.replace(tmp, path)
 PYEOF
 }
