@@ -48,7 +48,7 @@ const List<String> kAudioExtensions = [
 
 /// This build's marketing version (kept in step with pubspec.yaml;
 /// the update checker compares it against GitHub's latest release).
-const String kAppVersion = '0.5.0';
+const String kAppVersion = '0.5.1';
 
 /// Numeric dotted-version compare: is [candidate] newer than
 /// [current]? ("0.10.0" > "0.9.9")
@@ -1625,6 +1625,9 @@ class _UploadPageState extends State<UploadPage> {
         _enqueue(f.name, path, size);
       }
     });
+    // Start automatically (0.5.1): picking files IS the instruction
+    // to upload them — no second tap on "Upload N files".
+    _runQueue();
   }
 
   void _addDropped(List<dynamic> files) {
@@ -1653,6 +1656,8 @@ class _UploadPageState extends State<UploadPage> {
           ? 'Skipped 1 non-audio file.'
           : 'Skipped $skipped non-audio files.');
     }
+    // Dropped files start uploading right away too (0.5.1).
+    _runQueue();
   }
 
   /// Start (or restart) the queue run: duplicate-check everything

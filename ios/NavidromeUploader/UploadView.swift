@@ -124,7 +124,7 @@ struct UploadView: View {
                     }
                     .disabled(isRunning)
                 } footer: {
-                    Text("A picked folder (for example an album) expands to every audio file inside it, in track order. Uploads keep going in the background if you lock the phone.")
+                    Text("A picked folder (for example an album) expands to every audio file inside it, in track order. Uploads start automatically as soon as you've picked, and keep going in the background if you lock the phone.")
                 }
 
                 if let note {
@@ -344,6 +344,14 @@ struct UploadView: View {
                     }
                 }
             }
+        }
+
+        // Start automatically (0.5.1): picking files IS the
+        // instruction to upload them — no second tap on an
+        // "Upload N files" button. The button stays for resuming a
+        // prepared queue that never ran.
+        if pendingCount > 0 && !isRunning {
+            runQueue()
         }
 
         let skipped = queue.filter { $0.state == .skippedDuplicate }.count
