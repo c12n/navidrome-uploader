@@ -49,7 +49,7 @@ const List<String> kAudioExtensions = [
 
 /// This build's marketing version (kept in step with pubspec.yaml;
 /// the update checker compares it against GitHub's latest release).
-const String kAppVersion = '0.5.2';
+const String kAppVersion = '0.6.0';
 
 /// Numeric dotted-version compare: is [candidate] newer than
 /// [current]? ("0.10.0" > "0.9.9")
@@ -133,6 +133,12 @@ class UploadResult {
   // How the server pulled a direct download down (0.5.0).
   final bool downloadAccelerated;
   final int downloadConnections;
+  // What the song file itself reported (0.6.0 server extraction).
+  final bool bundledArt;
+  final int durationSeconds;
+  final List<String> featuring;
+  final String? artist;
+  final String? album;
 
   const UploadResult({
     required this.savedAs,
@@ -149,6 +155,11 @@ class UploadResult {
     this.failedTracks = const [],
     this.downloadAccelerated = false,
     this.downloadConnections = 1,
+    this.bundledArt = false,
+    this.durationSeconds = 0,
+    this.featuring = const [],
+    this.artist,
+    this.album,
   });
 
   factory UploadResult.fromJson(Map<String, dynamic> j) {
@@ -180,6 +191,13 @@ class UploadResult {
       downloadConnections: dl is Map<String, dynamic>
           ? (dl['connections'] as num?)?.toInt() ?? 1
           : 1,
+      bundledArt: j['bundled_art'] == true,
+      durationSeconds: (j['duration_seconds'] as num?)?.toInt() ?? 0,
+      featuring: j['featuring'] is List
+          ? (j['featuring'] as List).map((e) => e.toString()).toList()
+          : const [],
+      artist: j['artist'] as String?,
+      album: j['album'] as String?,
     );
   }
 
@@ -192,7 +210,14 @@ class UploadResult {
     } else if (enriched) {
       notes.add('Metadata cleaned up');
     }
+    if (bundledArt) notes.add('Album art from the upload');
     if (lyricsEmbedded) notes.add('Lyrics embedded');
+    if (durationSeconds > 0) {
+      final m = durationSeconds ~/ 60;
+      final s = (durationSeconds % 60).toString().padLeft(2, '0');
+      notes.add('$m:$s');
+    }
+    if (featuring.isNotEmpty) notes.add('feat. ${featuring.join(', ')}');
     if (downloadAccelerated) {
       notes.add('⚡ Accelerated download ×$downloadConnections');
     }
@@ -830,32 +855,58 @@ class NaviApi {
     bool enrich = false,
     bool lyrics = false,
     bool sort = false,
+    File? cover,
+    File? lyricsFile,
     required void Function(double progress) onProgress,
   }) async {
     final fileLength = await file.length();
     final boundary =
         'naviupload-${DateTime.now().millisecondsSinceEpoch.toRadixString(16)}';
-    var safeName = displayName
-        .replaceAll('"', "'")
-        .replaceAll('\r', ' ')
-        .replaceAll('\n', ' ');
-    if (safeName.isEmpty) safeName = 'upload';
+    String safe(String name) {
+      var s = name
+          .replaceAll('"', "'")
+          .replaceAll('\r', ' ')
+          .replaceAll('\n', ' ');
+      return s.isEmpty ? 'upload' : s;
+    }
+
+    final safeName = safe(displayName);
     // The processing flags ride along as plain form fields ahead of
     // the file part, in the same hand-assembled multipart body.
     String formField(String name, bool value) => '--$boundary\r\n'
         'Content-Disposition: form-data; name="$name"\r\n\r\n'
         '${value ? 'true' : 'false'}\r\n';
+    String partHeader(String field, String filename) => '--$boundary\r\n'
+        'Content-Disposition: form-data; name="$field"; '
+        'filename="${safe(filename)}"\r\n'
+        'Content-Type: application/octet-stream\r\n\r\n';
+    String baseName(String p) =>
+        p.replaceAll('\\', '/').split('/').last;
+
     final headerBuffer = StringBuffer()
       ..write(formField('enrich', enrich))
       ..write(formField('lyrics', lyrics))
       ..write(formField('sort', sort))
-      ..write('--$boundary\r\n')
-      ..write('Content-Disposition: form-data; name="file"; '
-          'filename="$safeName"\r\n')
-      ..write('Content-Type: application/octet-stream\r\n\r\n');
+      ..write(partHeader('file', safeName));
     final header = utf8.encode(headerBuffer.toString());
     final footer = utf8.encode('\r\n--$boundary--\r\n');
-    final total = header.length + fileLength + footer.length;
+
+    // Album art / lyrics sidecars (0.6.0) ride as extra file parts
+    // after the song; the server embeds them into it.
+    final extras = <(List<int>, File)>[];
+    var extrasLength = 0;
+    for (final (field, extra) in [
+      ('cover', cover),
+      ('lyrics_file', lyricsFile),
+    ]) {
+      if (extra == null) continue;
+      final h = utf8.encode(
+          '\r\n${partHeader(field, baseName(extra.path))}');
+      final len = await extra.length();
+      extras.add((h, extra));
+      extrasLength += h.length + len;
+    }
+    final total = header.length + fileLength + extrasLength + footer.length;
 
     var sent = 0;
     Stream<List<int>> body() async* {
@@ -866,6 +917,16 @@ class NaviApi {
         sent += chunk.length;
         onProgress(total == 0 ? 0 : sent / total);
         yield chunk;
+      }
+      for (final (h, extra) in extras) {
+        sent += h.length;
+        onProgress(total == 0 ? 0 : sent / total);
+        yield h;
+        await for (final chunk in extra.openRead()) {
+          sent += chunk.length;
+          onProgress(total == 0 ? 0 : sent / total);
+          yield chunk;
+        }
       }
       yield footer;
     }
@@ -1480,6 +1541,10 @@ class QueueItem {
   int attempts = 0;
   // The library holds a different file with this exact byte size.
   bool sizeNote = false;
+  // Album art / lyrics sidecars found beside the song (0.6.0);
+  // the server embeds them into the uploaded file.
+  String? coverPath;
+  String? lyricsPath;
 
   QueueItem({required this.name, required this.path, required this.size});
 }
@@ -1599,14 +1664,17 @@ class _UploadPageState extends State<UploadPage> {
         .showSnackBar(SnackBar(content: Text(text)));
   }
 
-  void _enqueue(String name, String path, int size) {
-    _queue.add(QueueItem(name: name, path: path, size: size));
+  void _enqueue(String name, String path, int size,
+      {String? coverPath, String? lyricsPath}) {
+    _queue.add(QueueItem(name: name, path: path, size: size)
+      ..coverPath = coverPath
+      ..lyricsPath = lyricsPath);
   }
 
   Future<void> _pickFiles() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: kAudioExtensions,
+      allowedExtensions: [...kAudioExtensions, 'zip'],
       allowMultiple: true,
       withData: false,
     );
@@ -1648,48 +1716,117 @@ class _UploadPageState extends State<UploadPage> {
     }
   }
 
-  /// Add files — and, since 0.5.2, folders: a folder expands
-  /// recursively to every audio file inside it, in path order, so
-  /// dropping an album folder queues the whole album. Files already
-  /// in the queue are not added twice.
+  static const _imageExtensions = {'jpg', 'jpeg', 'png'};
+  static const _lyricsExtensions = {'lrc', 'txt'};
+  static const _coverNames = {
+    'cover', 'folder', 'front', 'album', 'albumart', 'artwork'
+  };
+
+  String _parentDir(String p) {
+    final norm = p.replaceAll('\\', '/');
+    final idx = norm.lastIndexOf('/');
+    return idx <= 0 ? '' : norm.substring(0, idx);
+  }
+
+  String _stemOf(String name) {
+    final idx = name.lastIndexOf('.');
+    return (idx > 0 ? name.substring(0, idx) : name).toLowerCase();
+  }
+
+  bool _queueable(String name) {
+    final ext = _extOf(name);
+    return kAudioExtensions.contains(ext) || ext == 'zip';
+  }
+
+  /// Add files — folders since 0.5.2, ZIPs and sidecars since
+  /// 0.6.0: a folder expands recursively to every audio file and
+  /// ZIP inside it, in path order, so dropping an album folder
+  /// queues the whole album. A ZIP is queued whole (the server
+  /// unpacks it). Album art and lyrics files sitting beside a song
+  /// ride along as its sidecars: a folder's cover.jpg / folder.jpg
+  /// goes with each of its songs, and a .lrc sharing a song's name
+  /// goes with that song. Files already queued aren't added twice.
   Future<void> _addPaths(List<String> paths) async {
     final seen = _queue.map((q) => q.path).toSet();
-    final found = <String>[];
+    final songs = <String>[];
+    final imagesByDir = <String, List<String>>{};
+    final lyricsByKey = <String, List<String>>{};
     var skipped = 0;
     var emptyFolders = 0;
+
+    void harvest(String filePath) {
+      final name = _basename(filePath);
+      final ext = _extOf(name);
+      final dir = _parentDir(filePath);
+      if (_queueable(name)) {
+        songs.add(filePath);
+      } else if (_imageExtensions.contains(ext)) {
+        imagesByDir.putIfAbsent(dir, () => []).add(filePath);
+      } else if (_lyricsExtensions.contains(ext)) {
+        lyricsByKey.putIfAbsent('$dir|${_stemOf(name)}', () => []).add(filePath);
+      }
+    }
+
     for (final path in paths) {
       final type = FileSystemEntity.typeSync(path);
       if (type == FileSystemEntityType.directory) {
-        final inside = <String>[];
+        final before = songs.length;
         try {
           await for (final entity
               in Directory(path).list(recursive: true, followLinks: false)) {
-            if (entity is File &&
-                kAudioExtensions.contains(_extOf(_basename(entity.path)))) {
-              inside.add(entity.path);
-            }
+            if (entity is File) harvest(entity.path);
           }
         } catch (_) {
           // An unreadable folder counts as an empty one below.
         }
-        inside.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
-        if (inside.isEmpty) emptyFolders++;
-        for (final p in inside) {
-          if (seen.add(p)) found.add(p);
-        }
+        if (songs.length == before) emptyFolders++;
       } else if (type == FileSystemEntityType.file) {
-        if (!kAudioExtensions.contains(_extOf(_basename(path)))) {
+        if (_queueable(_basename(path)) ||
+            _imageExtensions.contains(_extOf(_basename(path))) ||
+            _lyricsExtensions.contains(_extOf(_basename(path)))) {
+          harvest(path);
+        } else {
           skipped++;
-        } else if (seen.add(path)) {
-          found.add(path);
         }
       }
     }
+
+    songs.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    String? coverFor(String dir) {
+      final images = imagesByDir[dir];
+      if (images == null || images.isEmpty) return null;
+      final sorted = [...images]
+        ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+      for (final img in sorted) {
+        if (_coverNames.contains(_stemOf(_basename(img)))) return img;
+      }
+      return sorted.first;
+    }
+
+    final found = <(String, String?, String?)>[];
+    for (final p in songs) {
+      if (!seen.add(p)) continue;
+      String? cover;
+      String? lyr;
+      if (_extOf(_basename(p)) != 'zip') {
+        final dir = _parentDir(p);
+        cover = coverFor(dir);
+        final candidates = lyricsByKey['$dir|${_stemOf(_basename(p))}'];
+        if (candidates != null && candidates.isNotEmpty) {
+          lyr = candidates.firstWhere(
+              (c) => _extOf(_basename(c)) == 'lrc',
+              orElse: () => candidates.first);
+        }
+      }
+      found.add((p, cover, lyr));
+    }
+
     if (!mounted) return;
     if (found.isNotEmpty) {
       setState(() {
-        for (final p in found) {
-          _enqueue(_basename(p), p, _sizeOf(p));
+        for (final (p, cover, lyr) in found) {
+          _enqueue(_basename(p), p, _sizeOf(p),
+              coverPath: cover, lyricsPath: lyr);
         }
       });
     }
@@ -1816,6 +1953,8 @@ class _UploadPageState extends State<UploadPage> {
           enrich: appState.enrichFiles,
           lyrics: appState.embedLyrics,
           sort: appState.sortFolders,
+          cover: item.coverPath == null ? null : File(item.coverPath!),
+          lyricsFile: item.lyricsPath == null ? null : File(item.lyricsPath!),
           onProgress: (p) {
             if (mounted) {
               setState(() => item.progress = p);
@@ -1879,6 +2018,10 @@ class _UploadPageState extends State<UploadPage> {
                 ? 'Saved as ${item.savedAs} · library scan started'
                 : 'Saved as ${item.savedAs}',
             ...?item.result?.processingNotes,
+            if (item.result?.via == 'zip' &&
+                (item.result?.alsoSaved ?? 0) > 0)
+              '+ ${item.result!.alsoSaved} more song'
+                  '${item.result!.alsoSaved == 1 ? '' : 's'} from the ZIP',
           ].join(' · '),
           style: theme.textTheme.bodyMedium,
         );
@@ -2112,13 +2255,13 @@ class _UploadPageState extends State<UploadPage> {
                 Text(
                   _dragging
                       ? 'Let go to add them'
-                      : 'Drop audio files or folders here',
+                      : 'Drop audio files, folders or ZIPs here',
                   style: theme.textTheme.titleLarge,
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  'A dropped folder adds every song inside it · MP3, M4A, FLAC, WAV, OGG, Opus, AAC',
+                  'A dropped folder adds every song inside it · a ZIP is unpacked on the server · album art and lyrics files beside the songs are embedded into them',
                   style: theme.textTheme.bodyMedium
                       ?.copyWith(color: scheme.onSurfaceVariant),
                   textAlign: TextAlign.center,

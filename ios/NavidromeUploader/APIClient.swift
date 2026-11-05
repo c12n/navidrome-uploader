@@ -248,6 +248,8 @@ struct APIClient {
                     enrich: Bool = false,
                     lyrics: Bool = false,
                     sort: Bool = false,
+                    coverURL: URL? = nil,
+                    lyricsURL: URL? = nil,
                     progress: @escaping @MainActor (Double) -> Void) async throws -> UploadResponse {
         var req = try request(for: "upload")
         req.httpMethod = "POST"
@@ -278,6 +280,19 @@ struct APIClient {
         body.append(disposition.data(using: .utf8)!)
         body.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
         body.append(fileData)
+
+        // Album art / lyrics sidecars (0.6.0): best-effort extra
+        // parts the server embeds into the song. The picked folder's
+        // security scope is held by the queue, so these read fine.
+        func appendPart(name: String, url: URL?) {
+            guard let url, let data = try? Data(contentsOf: url) else { return }
+            body.append("\r\n--\(boundary)\r\n".data(using: .utf8)!)
+            body.append("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(url.lastPathComponent)\"\r\n".data(using: .utf8)!)
+            body.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
+            body.append(data)
+        }
+        appendPart(name: "cover", url: coverURL)
+        appendPart(name: "lyrics_file", url: lyricsURL)
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
 
         // Background path: the session needs the body in a file.

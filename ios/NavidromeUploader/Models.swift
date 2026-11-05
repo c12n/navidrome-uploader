@@ -66,6 +66,12 @@ struct UploadResponse: Decodable {
     let files: [UploadResponse]
     let failedTracks: [String]
     let download: DownloadInfo?
+    // What the song file itself reported (0.6.0 server extraction).
+    let bundledArt: Bool
+    let durationSeconds: Int
+    let featuring: [String]
+    let artist: String?
+    let album: String?
 
     enum CodingKeys: String, CodingKey {
         case savedAs = "saved_as"
@@ -81,6 +87,11 @@ struct UploadResponse: Decodable {
         case files
         case failedTracks = "failed_tracks"
         case download
+        case bundledArt = "bundled_art"
+        case durationSeconds = "duration_seconds"
+        case featuring
+        case artist
+        case album
     }
 
     init(from decoder: Decoder) throws {
@@ -98,6 +109,11 @@ struct UploadResponse: Decodable {
         files = (try? c.decodeIfPresent([UploadResponse].self, forKey: .files)) ?? nil ?? []
         failedTracks = (try? c.decodeIfPresent([String].self, forKey: .failedTracks)) ?? nil ?? []
         download = (try? c.decodeIfPresent(DownloadInfo.self, forKey: .download)) ?? nil
+        bundledArt = (try? c.decodeIfPresent(Bool.self, forKey: .bundledArt)) ?? nil ?? false
+        durationSeconds = (try? c.decodeIfPresent(Int.self, forKey: .durationSeconds)) ?? nil ?? 0
+        featuring = (try? c.decodeIfPresent([String].self, forKey: .featuring)) ?? nil ?? []
+        artist = (try? c.decodeIfPresent(String.self, forKey: .artist)) ?? nil
+        album = (try? c.decodeIfPresent(String.self, forKey: .album)) ?? nil
     }
 
     /// Short human summary of the server-side processing, for history
@@ -109,7 +125,14 @@ struct UploadResponse: Decodable {
         } else if enriched {
             notes.append("Metadata cleaned up")
         }
+        if bundledArt { notes.append("Album art from the upload") }
         if lyricsEmbedded { notes.append("Lyrics embedded") }
+        if durationSeconds > 0 {
+            notes.append("\(durationSeconds / 60):\(String(format: "%02d", durationSeconds % 60))")
+        }
+        if !featuring.isEmpty {
+            notes.append("feat. \(featuring.joined(separator: ", "))")
+        }
         if let download, download.accelerated {
             notes.append("⚡ Accelerated download ×\(download.connections)")
         }

@@ -240,12 +240,128 @@ async def recent(x_upload_token: str | None = Header(default=None)) -> dict:
     return {"uploads": items[-20:][::-1]}
 
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+LYRICS_EXTS = {".lrc", ".txt"}
+COVER_NAMES = ("cover", "folder", "front", "album", "albumart", "artwork")
+
+
+def _unzip_album(zip_path: str, workdir: str) -> list:
+    """Unpack an uploaded ZIP album (0.6.0). Returns one dict per
+    audio track: {local, fname, cover (bytes|None), lyrics (str|None)}.
+    Album art found in a track's own folder (cover.jpg / folder.jpg /
+    front.*, else the folder's first image) and a .lrc/.txt sharing
+    the track's filename are bundled with that track, so the album's
+    own assets tag its songs."""
+    zdir = tempfile.mkdtemp(dir=workdir)
+    with zipfile.ZipFile(zip_path) as zf:
+        total = sum(max(info.file_size, 0) for info in zf.infolist())
+        if total > MAX_BYTES:
+            raise HTTPException(413, "ZIP contents too large")
+        zf.extractall(zdir)
+    covers: dict = {}
+    lyrics_map: dict = {}
+    tracks: list = []
+    for root, _dirs, names in os.walk(zdir):
+        images, lyr = [], []
+        for n in sorted(names):
+            ext = os.path.splitext(n)[1].lower()
+            p = os.path.join(root, n)
+            if ext in IMAGE_EXTS:
+                images.append((n, p))
+            elif ext in LYRICS_EXTS:
+                lyr.append((n, p, ext))
+            elif ext in AUDIO_EXTS:
+                tracks.append((p, n))
+        if images:
+            best = next(
+                (p for n, p in images
+                 if os.path.splitext(n)[0].lower() in COVER_NAMES),
+                images[0][1])
+            try:
+                with open(best, "rb") as fh:
+                    data = fh.read(6_000_000)
+                if data:
+                    covers[root] = data
+            except OSError:
+                pass
+        for n, p, ext in lyr:
+            key = (root, os.path.splitext(n)[0].lower())
+            if key in lyrics_map and ext != ".lrc":
+                continue  # a .lrc already claimed this stem
+            try:
+                with open(p, encoding="utf-8", errors="ignore") as fh:
+                    text = fh.read(262_144).strip()
+                if text:
+                    lyrics_map[key] = text
+            except OSError:
+                pass
+
+    def cover_for(directory: str):
+        d = directory
+        while True:
+            if d in covers:
+                return covers[d]
+            if d == zdir:
+                return None
+            d = os.path.dirname(d)
+
+    # Album art can also live INSIDE a song file (0.6.0): when a
+    # folder has no image file, harvest the embedded art from its
+    # tracks and share it with same-album / same-folder tracks that
+    # carry none of their own, so the whole album ends up tagged.
+    embedded = {}
+    for p, _n in tracks:
+        data = embedded_cover(p)
+        if data:
+            embedded[p] = data
+    album_art: dict = {}
+    dir_art: dict = {}
+    for p, _n in tracks:
+        if p in embedded:
+            dir_art.setdefault(os.path.dirname(p), embedded[p])
+            alb = read_tags(p)["album"].strip().lower()
+            if alb:
+                album_art.setdefault(alb, embedded[p])
+
+    out = []
+    for p, n in sorted(tracks):
+        d = os.path.dirname(p)
+        stem = os.path.splitext(n)[0].lower()
+        cov = cover_for(d)
+        if cov is None and p not in embedded:
+            alb = read_tags(p)["album"].strip().lower()
+            cov = album_art.get(alb) or dir_art.get(d)
+        out.append({"local": p, "fname": n,
+                    "cover": cov,
+                    "lyrics": lyrics_map.get((d, stem))})
+    return out
+
+
+async def _read_bundled(cover: UploadFile | None,
+                        lyrics_file: UploadFile | None):
+    """Read the app's attached album art / lyrics sidecars (0.6.0)."""
+    cover_bytes, lyrics_text = None, None
+    if cover is not None and (cover.filename or "").strip():
+        data = await cover.read(6_000_001)
+        if data and len(data) <= 6_000_000:
+            cover_bytes = data
+    if lyrics_file is not None and (lyrics_file.filename or "").strip():
+        raw = await lyrics_file.read(262_145)
+        if raw and len(raw) <= 262_144:
+            text = raw.decode("utf-8", errors="ignore").strip()
+            if text:
+                lyrics_text = text
+    return cover_bytes, lyrics_text
+
+
 @app.post("/upload")
 async def upload(
     file: UploadFile = File(...),
     enrich: str = Form("false"),
     lyrics: str = Form("false"),
     sort: str = Form("false"),
+    cover: UploadFile | None = File(None),
+    lyrics_file: UploadFile | None = File(None),
     x_upload_token: str | None = Header(default=None),
 ) -> dict:
     require_token(x_upload_token)
@@ -265,8 +381,38 @@ async def upload(
     except HTTPException:
         os.unlink(tmp)
         raise
+    if suffix.lower() == ".zip":
+        # An uploaded album ZIP (0.6.0): unzip it, take the songs
+        # out, and tag each with the album art / lyrics bundled
+        # inside. The response is the bundle shape the apps already
+        # render for ZIP links (first + also_saved + files).
+        workdir = tempfile.mkdtemp(dir=DATA_DIR if os.path.isdir(DATA_DIR) else None)
+        try:
+            tracks = _unzip_album(tmp, workdir)
+            if not tracks:
+                raise HTTPException(
+                    400, "That ZIP contains no audio files we can add")
+            saved = []
+            for t in tracks:
+                saved.append(await save_processed(
+                    t["local"], t["fname"], "file",
+                    _flag(enrich), _flag(lyrics), _flag(sort),
+                    bundled_cover=t["cover"], bundled_lyrics=t["lyrics"]))
+            first = saved[0]
+            first["via"] = "zip"
+            if len(saved) > 1:
+                first["also_saved"] = len(saved) - 1
+                first["files"] = [s["saved_as"] for s in saved]
+            return first
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    bundled_cover, bundled_lyrics = await _read_bundled(cover, lyrics_file)
     return await save_processed(tmp, file.filename or "upload", "file",
-                                _flag(enrich), _flag(lyrics), _flag(sort))
+                                _flag(enrich), _flag(lyrics), _flag(sort),
+                                bundled_cover=bundled_cover,
+                                bundled_lyrics=bundled_lyrics)
 
 
 # ------------------------------------------- metadata enrichment (0.2.0) --
@@ -313,7 +459,8 @@ def _tag_get(audio, *keys) -> str:
 
 
 def read_tags(path: str) -> dict:
-    out = {"title": "", "artist": "", "album": "", "duration": 0.0}
+    out = {"title": "", "artist": "", "album": "", "album_artist": "",
+           "duration": 0.0}
     if not _HAS_MUTAGEN:
         return out
     try:
@@ -329,7 +476,76 @@ def read_tags(path: str) -> dict:
     out["title"] = _tag_get(audio, "TIT2", "\xa9nam", "title", "TITLE")
     out["artist"] = _tag_get(audio, "TPE1", "\xa9ART", "artist", "ARTIST")
     out["album"] = _tag_get(audio, "TALB", "\xa9alb", "album", "ALBUM")
+    out["album_artist"] = _tag_get(audio, "TPE2", "aART", "albumartist",
+                                   "ALBUMARTIST")
     return out
+
+
+_FEAT_RE = re.compile(
+    r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^\)\]]+)[\)\]]"
+    r"|(?:^|[\s,])(?:feat\.?|ft\.?|featuring)\s+(.+)$", re.I)
+
+
+def extract_features(*texts) -> list:
+    """Featured artists named in a title / artist string:
+    'Song (feat. A & B)' -> ['A', 'B']."""
+    feats: list = []
+    for text in texts:
+        for m in _FEAT_RE.finditer(text or ""):
+            raw = (m.group(1) or m.group(2) or "").strip()
+            for part in re.split(r"\s*(?:,|&|\band\b|\bwith\b)\s*", raw):
+                p = part.strip(" .")
+                if p and p.lower() not in [f.lower() for f in feats]:
+                    feats.append(p)
+    return feats
+
+
+def _query_title(title: str) -> str:
+    """Title with the featuring segment removed — identification
+    and lyrics sources match far better without it."""
+    t = re.sub(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)[^\)\]]*[\)\]]",
+               " ", title or "", flags=re.I)
+    t = re.sub(r"\s+(?:feat\.?|ft\.?|featuring)\s+.+$", "", t, flags=re.I)
+    return re.sub(r"\s+", " ", t).strip(" -")
+
+
+def embedded_cover(path: str) -> bytes | None:
+    """The album art embedded in the audio file itself, if any."""
+    if not _HAS_MUTAGEN:
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".mp3":
+            apics = ID3(path).getall("APIC")
+            for a in apics:
+                if a.type == 3:
+                    return a.data
+            return apics[0].data if apics else None
+        if ext in (".m4a", ".mp4"):
+            audio = MP4(path)
+            covr = audio.tags.get("covr") if audio and audio.tags else None
+            return bytes(covr[0]) if covr else None
+        if ext == ".flac":
+            audio = FLAC(path)
+            return audio.pictures[0].data if audio.pictures else None
+        audio = mutagen.File(path)
+        if audio is not None and getattr(audio, "pictures", None):
+            return audio.pictures[0].data
+    except Exception:
+        return None
+    return None
+
+
+def extract_file_info(path: str) -> dict:
+    """Everything the song file itself knows (0.6.0): title, artist,
+    album, album artist, track length, featured artists, and whether
+    it already carries album art."""
+    tags = read_tags(path)
+    return {"title": tags["title"], "artist": tags["artist"],
+            "album": tags["album"], "album_artist": tags["album_artist"],
+            "duration_seconds": int(round(tags["duration"])),
+            "featuring": extract_features(tags["title"], tags["artist"]),
+            "has_cover": embedded_cover(path) is not None}
 
 
 def _cover_mime(data: bytes) -> str:
@@ -646,9 +862,10 @@ async def enrich_file(path: str, want_meta: bool, want_lyrics: bool,
         artist = known.get("artist") or artist
     meta, cover = None, None
     if want_meta:
-        meta = await _identify_itunes(title, artist)
+        q_title = _query_title(title) or title
+        meta = await _identify_itunes(q_title, artist)
         if meta is None:
-            meta = await _identify_musicbrainz(title, artist)
+            meta = await _identify_musicbrainz(q_title, artist)
         if meta is None and known:
             meta = {"title": known.get("title") or title,
                     "artist": known.get("artist") or artist,
@@ -676,7 +893,7 @@ async def enrich_file(path: str, want_meta: bool, want_lyrics: bool,
     lyrics = None
     if want_lyrics:
         lyrics = await _fetch_lyrics(
-            meta["title"] if meta else title,
+            meta["title"] if meta else _query_title(title) or title,
             meta["artist"] if meta else artist,
             tags["duration"])
     if meta or lyrics:
@@ -745,18 +962,39 @@ def _sort_subdir(path: str) -> str:
 
 async def save_processed(local: str, fname: str, source: str,
                          want_meta: bool, want_lyrics: bool,
-                         sort: bool, known: dict | None = None) -> dict:
-    """Enrich (optional) -> sort into Artist/Album (optional) -> save."""
+                         sort: bool, known: dict | None = None,
+                         bundled_cover: bytes | None = None,
+                         bundled_lyrics: str | None = None) -> dict:
+    """Enrich (optional) -> sort into Artist/Album (optional) -> save.
+
+    Bundled cover art / lyrics (0.6.0) come with the upload itself —
+    inside a ZIP, or attached by the app from the song's own folder —
+    so they are the album's own assets: they are always embedded when
+    present (even when the online enrichment toggles are off), and
+    they win over anything enrichment fetched."""
     report = {"matched": False, "source": None,
               "lyrics_embedded": False, "title": None}
     if want_meta or want_lyrics:
         report = await enrich_file(local, want_meta, want_lyrics, fname,
                                    known)
+    if bundled_cover or bundled_lyrics:
+        if write_tags(local, None, bundled_cover, bundled_lyrics):
+            if bundled_lyrics:
+                report["lyrics_embedded"] = True
+    info = extract_file_info(local)
     subdir = _sort_subdir(local) if sort else ""
     entry = await finish_save(local, fname, source, subdir)
     entry["enriched"] = report["matched"]
     entry["metadata_source"] = report["source"]
     entry["lyrics_embedded"] = report["lyrics_embedded"]
+    entry["bundled_art"] = bool(bundled_cover)
+    entry["duration_seconds"] = info["duration_seconds"]
+    if info["featuring"]:
+        entry["featuring"] = info["featuring"]
+    if info["artist"]:
+        entry["artist"] = info["artist"]
+    if info["album"]:
+        entry["album"] = info["album"]
     if report["title"]:
         entry["matched_title"] = report["title"]
     return entry

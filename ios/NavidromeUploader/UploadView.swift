@@ -33,6 +33,10 @@ private struct QueueItem: Identifiable {
     var attempts: Int = 0
     var possibleDuplicate = false
     var response: UploadResponse?
+    // Album art / lyrics sidecars found beside the song (0.6.0);
+    // the server embeds them into the uploaded file.
+    var cover: URL?
+    var lyricsFile: URL?
 
     var name: String { url.lastPathComponent }
 }
@@ -54,7 +58,7 @@ struct UploadView: View {
         UserDefaults.standard.string(forKey: "update.dismissedVersion")
 
     private var pickerTypes: [UTType] {
-        var types: [UTType] = [.audio, .mp3, .mpeg4Audio, .wav, .aiff, .folder]
+        var types: [UTType] = [.audio, .mp3, .mpeg4Audio, .wav, .aiff, .folder, .zip]
         for ext in ["flac", "ogg", "oga", "opus", "aac", "m4a"] {
             if let t = UTType(filenameExtension: ext) { types.append(t) }
         }
@@ -63,6 +67,12 @@ struct UploadView: View {
 
     private static let audioExtensions: Set<String> = [
         "mp3", "m4a", "flac", "wav", "ogg", "oga", "opus", "aac", "aif", "aiff",
+    ]
+
+    private static let imageExtensions: Set<String> = ["jpg", "jpeg", "png"]
+    private static let lyricsExtensions: Set<String> = ["lrc", "txt"]
+    private static let coverNames: Set<String> = [
+        "cover", "folder", "front", "album", "albumart", "artwork",
     ]
 
     private var pendingCount: Int { queue.filter { $0.state == .pending }.count }
@@ -117,14 +127,14 @@ struct UploadView: View {
                         showImporter = true
                     } label: {
                         Label(queue.isEmpty
-                              ? "Choose audio files or a folder"
-                              : "Add more files or a folder",
+                              ? "Choose audio files, a folder or a ZIP"
+                              : "Add more files, a folder or a ZIP",
                               systemImage: "folder")
                             .font(.headline)
                     }
                     .disabled(isRunning)
                 } footer: {
-                    Text("A picked folder (for example an album) expands to every audio file inside it, in track order. Uploads start automatically as soon as you've picked, and keep going in the background if you lock the phone.")
+                    Text("A picked folder (for example an album) expands to every audio file inside it, in track order; a picked ZIP is unpacked by the server. Album art and lyrics files found with the songs are embedded into them. Uploads start automatically as soon as you've picked, and keep going in the background if you lock the phone.")
                 }
 
                 if let note {
@@ -227,7 +237,10 @@ struct UploadView: View {
                     .lineLimit(3)
             case .done:
                 if let response = item.response {
-                    let notes = response.processingNotes
+                    var notes = response.processingNotes
+                    if response.via == "zip", response.alsoSaved > 0 {
+                        notes.append("+ \(response.alsoSaved) more song\(response.alsoSaved == 1 ? "" : "s") from the ZIP")
+                    }
                     Text(notes.isEmpty
                          ? "In the library"
                          : notes.joined(separator: " \u{00B7} "))
@@ -273,12 +286,37 @@ struct UploadView: View {
 
     // MARK: Selection + duplicate check
 
-    /// Expands picked URLs into a flat, path-ordered list of audio
-    /// files: folders are walked recursively, plain files are kept
-    /// when their extension is a supported audio type.
-    private func expand(_ urls: [URL]) -> [URL] {
-        var files: [URL] = []
+    private struct ExpandedItem {
+        let url: URL
+        var cover: URL?
+        var lyricsFile: URL?
+    }
+
+    /// Expands picked URLs into a flat, path-ordered queue: folders
+    /// are walked recursively, ZIPs are kept whole (the server
+    /// unpacks them), and every song picks up the album art and
+    /// lyrics files sitting beside it (0.6.0) — a folder's
+    /// cover.jpg / folder.jpg goes with each of its songs, and a
+    /// .lrc sharing a song's name goes with that song.
+    private func expand(_ urls: [URL]) -> [ExpandedItem] {
+        var songs: [URL] = []
+        var imagesByDir: [String: [URL]] = [:]
+        var lyricsByKey: [String: [URL]] = [:]
         let fm = FileManager.default
+
+        func harvest(_ file: URL) {
+            let ext = file.pathExtension.lowercased()
+            let dir = file.deletingLastPathComponent().path
+            if Self.audioExtensions.contains(ext) || ext == "zip" {
+                songs.append(file)
+            } else if Self.imageExtensions.contains(ext) {
+                imagesByDir[dir, default: []].append(file)
+            } else if Self.lyricsExtensions.contains(ext) {
+                let stem = file.deletingPathExtension().lastPathComponent.lowercased()
+                lyricsByKey["\(dir)|\(stem)", default: []].append(file)
+            }
+        }
+
         for url in urls {
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
@@ -288,16 +326,40 @@ struct UploadView: View {
                     includingPropertiesForKeys: [.isRegularFileKey],
                     options: [.skipsHiddenFiles]) else { continue }
                 for case let child as URL in walker {
-                    if Self.audioExtensions.contains(child.pathExtension.lowercased()) {
-                        files.append(child)
-                    }
+                    harvest(child)
                 }
-            } else if Self.audioExtensions.contains(url.pathExtension.lowercased()) {
-                files.append(url)
+            } else {
+                harvest(url)
             }
         }
-        return files.sorted {
-            $0.path.localizedStandardCompare($1.path) == .orderedAscending
+
+        func cover(for dir: String) -> URL? {
+            guard let images = imagesByDir[dir], !images.isEmpty else { return nil }
+            let sorted = images.sorted {
+                $0.path.localizedStandardCompare($1.path) == .orderedAscending
+            }
+            return sorted.first {
+                Self.coverNames.contains(
+                    $0.deletingPathExtension().lastPathComponent.lowercased())
+            } ?? sorted.first
+        }
+
+        var items: [ExpandedItem] = []
+        for song in songs {
+            var item = ExpandedItem(url: song)
+            if song.pathExtension.lowercased() != "zip" {
+                let dir = song.deletingLastPathComponent().path
+                item.cover = cover(for: dir)
+                let stem = song.deletingPathExtension().lastPathComponent.lowercased()
+                let candidates = lyricsByKey["\(dir)|\(stem)"] ?? []
+                item.lyricsFile = candidates.first {
+                    $0.pathExtension.lowercased() == "lrc"
+                } ?? candidates.first
+            }
+            items.append(item)
+        }
+        return items.sorted {
+            $0.url.path.localizedStandardCompare($1.url.path) == .orderedAscending
         }
     }
 
@@ -313,9 +375,11 @@ struct UploadView: View {
             }
         }
         var added = 0
-        for file in expand(picked) where !alreadyQueued.contains(file) {
-            var item = QueueItem(url: file)
-            item.size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?
+        for expanded in expand(picked) where !alreadyQueued.contains(expanded.url) {
+            var item = QueueItem(url: expanded.url)
+            item.cover = expanded.cover
+            item.lyricsFile = expanded.lyricsFile
+            item.size = (try? expanded.url.resourceValues(forKeys: [.fileSizeKey]))?
                 .fileSize ?? 0
             queue.append(item)
             added += 1
@@ -405,10 +469,13 @@ struct UploadView: View {
                         queue[index].attempts += 1
                         let itemID = queue[index].id
                         let fileURL = queue[index].url
+                        let coverURL = queue[index].cover
+                        let lyricsURL = queue[index].lyricsFile
                         do {
                             let response = try await client.uploadFile(
                                 fileURL: fileURL,
-                                enrich: enrich, lyrics: lyrics, sort: sort
+                                enrich: enrich, lyrics: lyrics, sort: sort,
+                                coverURL: coverURL, lyricsURL: lyricsURL
                             ) { fraction in
                                 if let i = queue.firstIndex(where: { $0.id == itemID }) {
                                     queue[i].progress = fraction
