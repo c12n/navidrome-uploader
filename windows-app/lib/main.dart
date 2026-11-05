@@ -1,7 +1,8 @@
 // NaviUpload for Windows.
 //
 // Desktop sibling of the NaviUpload iOS app: upload music straight
-// into a Navidrome library — pick or drag-and-drop audio files, or
+// into a Navidrome library — pick or drag-and-drop audio files or
+// folders full of them, or
 // paste a URL and let the companion server fetch it (direct audio
 // links are saved as-is; page links such as YouTube go through yt-dlp
 // on the server). The visual system mirrors Viu for Windows on
@@ -48,7 +49,7 @@ const List<String> kAudioExtensions = [
 
 /// This build's marketing version (kept in step with pubspec.yaml;
 /// the update checker compares it against GitHub's latest release).
-const String kAppVersion = '0.5.1';
+const String kAppVersion = '0.5.2';
 
 /// Numeric dotted-version compare: is [candidate] newer than
 /// [current]? ("0.10.0" > "0.9.9")
@@ -1630,34 +1631,89 @@ class _UploadPageState extends State<UploadPage> {
     _runQueue();
   }
 
-  void _addDropped(List<dynamic> files) {
+  String _basename(String p) {
+    final parts =
+        p.replaceAll('\\', '/').split('/').where((s) => s.isNotEmpty).toList();
+    return parts.isEmpty ? p : parts.last;
+  }
+
+  String _extOf(String name) =>
+      name.contains('.') ? name.split('.').last.toLowerCase() : '';
+
+  int _sizeOf(String path) {
+    try {
+      return File(path).lengthSync();
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// Add files — and, since 0.5.2, folders: a folder expands
+  /// recursively to every audio file inside it, in path order, so
+  /// dropping an album folder queues the whole album. Files already
+  /// in the queue are not added twice.
+  Future<void> _addPaths(List<String> paths) async {
+    final seen = _queue.map((q) => q.path).toSet();
+    final found = <String>[];
     var skipped = 0;
-    setState(() {
-      for (final f in files) {
-        final String path = f.path as String;
-        final String name = f.name as String;
-        final ext =
-            name.contains('.') ? name.split('.').last.toLowerCase() : '';
-        if (!kAudioExtensions.contains(ext)) {
-          skipped++;
-          continue;
-        }
-        var size = 0;
+    var emptyFolders = 0;
+    for (final path in paths) {
+      final type = FileSystemEntity.typeSync(path);
+      if (type == FileSystemEntityType.directory) {
+        final inside = <String>[];
         try {
-          size = File(path).lengthSync();
+          await for (final entity
+              in Directory(path).list(recursive: true, followLinks: false)) {
+            if (entity is File &&
+                kAudioExtensions.contains(_extOf(_basename(entity.path)))) {
+              inside.add(entity.path);
+            }
+          }
         } catch (_) {
-          size = 0;
+          // An unreadable folder counts as an empty one below.
         }
-        _enqueue(name, path, size);
+        inside.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+        if (inside.isEmpty) emptyFolders++;
+        for (final p in inside) {
+          if (seen.add(p)) found.add(p);
+        }
+      } else if (type == FileSystemEntityType.file) {
+        if (!kAudioExtensions.contains(_extOf(_basename(path)))) {
+          skipped++;
+        } else if (seen.add(path)) {
+          found.add(path);
+        }
       }
-    });
+    }
+    if (!mounted) return;
+    if (found.isNotEmpty) {
+      setState(() {
+        for (final p in found) {
+          _enqueue(_basename(p), p, _sizeOf(p));
+        }
+      });
+    }
     if (skipped > 0) {
       _snack(skipped == 1
           ? 'Skipped 1 non-audio file.'
           : 'Skipped $skipped non-audio files.');
+    } else if (found.isEmpty && emptyFolders > 0) {
+      _snack(emptyFolders == 1
+          ? 'That folder contains no audio files.'
+          : 'Those folders contain no audio files.');
     }
-    // Dropped files start uploading right away too (0.5.1).
-    _runQueue();
+    // Added files start uploading right away (0.5.1).
+    if (found.isNotEmpty) _runQueue();
+  }
+
+  void _addDropped(List<dynamic> files) {
+    _addPaths([for (final f in files) f.path as String]);
+  }
+
+  Future<void> _pickFolder() async {
+    final dir = await FilePicker.platform.getDirectoryPath();
+    if (dir == null || !mounted) return;
+    await _addPaths([dir]);
   }
 
   /// Start (or restart) the queue run: duplicate-check everything
@@ -2054,22 +2110,36 @@ class _UploadPageState extends State<UploadPage> {
                     color: _dragging ? scheme.primary : scheme.onSurfaceVariant),
                 const SizedBox(height: 12),
                 Text(
-                  _dragging ? 'Let go to add the files' : 'Drop audio files here',
+                  _dragging
+                      ? 'Let go to add them'
+                      : 'Drop audio files or folders here',
                   style: theme.textTheme.titleLarge,
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  'MP3, M4A, FLAC, WAV, OGG, Opus, AAC and more',
+                  'A dropped folder adds every song inside it · MP3, M4A, FLAC, WAV, OGG, Opus, AAC',
                   style: theme.textTheme.bodyMedium
                       ?.copyWith(color: scheme.onSurfaceVariant),
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 20),
-                FilledButton.icon(
-                  onPressed: _pickFiles,
-                  icon: const Icon(Icons.folder_open),
-                  label: const Text('Choose audio files'),
+                Wrap(
+                  alignment: WrapAlignment.center,
+                  spacing: 12,
+                  runSpacing: 8,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: _pickFiles,
+                      icon: const Icon(Icons.folder_open),
+                      label: const Text('Choose audio files'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _pickFolder,
+                      icon: const Icon(Icons.create_new_folder),
+                      label: const Text('Choose a folder'),
+                    ),
+                  ],
                 ),
               ],
             ),
