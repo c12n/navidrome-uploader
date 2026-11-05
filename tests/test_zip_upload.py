@@ -114,6 +114,13 @@ plain = os.path.join(LIB, "Plain Song.mp3")
 check("attached cover embedded + flagged",
       body.get("bundled_art") is True and os.path.exists(plain)
       and apic(plain) == COVER_ROOT)
+# Saved songs must land world-readable: Navidrome runs as another
+# user and silently skips files it cannot read (uploaded temp files
+# start life 0600 via mkstemp — regression check for that bug).
+import stat as _stat
+check("saved upload is world-readable (Navidrome can index it)",
+      os.path.exists(plain)
+      and bool(_stat.S_IMODE(os.stat(plain).st_mode) & 0o004))
 check("attached lyrics embedded + flagged",
       body.get("lyrics_embedded") is True and os.path.exists(plain)
       and "plain words" in uslt(plain))

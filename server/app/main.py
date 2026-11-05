@@ -201,6 +201,15 @@ async def finish_save(tmp_path: str, filename: str, source: str,
         raise HTTPException(400, "Downloaded / uploaded file is empty")
     dest = unique_path(sanitize_filename(filename), subdir)
     shutil.move(tmp_path, dest)
+    # Uploaded temp files are created 0600 (tempfile.mkstemp), and a
+    # moved file keeps those permissions — Navidrome runs as a
+    # different user and silently skips songs it cannot read, so an
+    # uploaded song would never show up. Make every saved song
+    # world-readable, like the downloaded ones already are.
+    try:
+        os.chmod(dest, 0o644)
+    except OSError:
+        pass
     bump_stats(size)
     scan = await trigger_scan()
     entry = {
