@@ -237,13 +237,7 @@ struct UploadView: View {
                     .lineLimit(3)
             case .done:
                 if let response = item.response {
-                    var notes = response.processingNotes
-                    if response.via == "zip", response.alsoSaved > 0 {
-                        notes.append("+ \(response.alsoSaved) more song\(response.alsoSaved == 1 ? "" : "s") from the ZIP")
-                    }
-                    Text(notes.isEmpty
-                         ? "In the library"
-                         : notes.joined(separator: " \u{00B7} "))
+                    Text(doneText(response))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
@@ -266,6 +260,16 @@ struct UploadView: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    /// Done-row summary line (kept out of the view builder: the
+    /// ZIP bundle count needs a mutable notes array).
+    private func doneText(_ response: UploadResponse) -> String {
+        var notes = response.processingNotes
+        if response.via == "zip", response.alsoSaved > 0 {
+            notes.append("+ \(response.alsoSaved) more song\(response.alsoSaved == 1 ? "" : "s") from the ZIP")
+        }
+        return notes.isEmpty ? "In the library" : notes.joined(separator: " \u{00B7} ")
     }
 
     @ViewBuilder
