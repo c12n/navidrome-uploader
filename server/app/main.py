@@ -224,6 +224,15 @@ async def finish_save(tmp_path: str, filename: str, source: str,
 @app.get("/health")
 async def health() -> dict:
     ok = os.path.isdir(LIBRARY_DIR)
+    # The box's auto-updater (server/autoupdate.sh) records what it did
+    # in the data dir; surface it here so the running release and the
+    # last auto-update result are visible at a glance.
+    autoupdate = None
+    try:
+        with open(os.path.join(DATA_DIR, "autoupdate-status.json")) as fh:
+            autoupdate = json.load(fh)
+    except Exception:
+        autoupdate = None
     return {
         "status": "ok" if ok else "library_missing",
         "service": "navidrome-uploader",
@@ -231,6 +240,7 @@ async def health() -> dict:
         "scan_configured": bool(NAVIDROME_URL and NAVIDROME_USER),
         "torbox_configured": bool(TORBOX_API_KEY),
         "premiumize_configured": bool(PREMIUMIZE_API_KEY),
+        "autoupdate": autoupdate,
     }
 
 

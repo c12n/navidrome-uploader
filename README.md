@@ -48,6 +48,21 @@ Tests: `python3 tests/test_server.py` (12 checks),
 `tests/test_torbox.py` (8) and `tests/test_premiumize.py` (7) — the
 debrid suites run against local stub APIs; all passing.
 
+### Automatic server updates
+
+`server/autoupdate.sh` keeps the deployed server in step with this
+repo's releases, so publishing a release is the whole server deploy.
+A one-time `sudo bash autoupdate.sh --install` on the box installs it
+as a root cron job (every 30 minutes). Each run reads the latest
+GitHub release, and only when a NEWER release exists does it fetch
+that release's `server/app/main.py` (pinned to the release tag, never
+the branch), verify it (sha256 recorded, Python syntax check), back
+up the current file to `app/main.py.bak`, install, recreate the
+container, and poll `/health`. A release that fails its health check
+is rolled back automatically and not retried. Every check and change
+is logged to `data/autoupdate.log`, and the current state is kept in
+`data/autoupdate-status.json` (also shown by `GET /health`).
+
 ## 2. iOS app (`ios/`)
 
 SwiftUI, iOS 17+, no third-party dependencies, modelled on the Viu and
