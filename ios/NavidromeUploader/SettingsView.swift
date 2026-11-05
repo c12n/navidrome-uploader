@@ -166,6 +166,9 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Version", value: Self.versionString)
+                    Link(destination: URL(string: "https://github.com/c12n/navidrome-uploader")!) {
+                        Label("GitHub repository", systemImage: "link")
+                    }
                 } footer: {
                     Text("NaviUpload \u{2014} upload music to your Navidrome library from files or URLs.")
                 }

@@ -3350,15 +3350,40 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
         const _SectionHeader('About'),
         Card(
-          child: ListTile(
-            leading: const AppIconBadge(size: 40),
-            title:
-                Text('NaviUpload $kAppVersion', style: theme.textTheme.titleMedium),
-            subtitle: Text(
-              'Upload music to your Navidrome library from files or '
-              'URLs.',
-              style: theme.textTheme.bodyMedium,
-            ),
+          child: Column(
+            children: [
+              ListTile(
+                leading: const AppIconBadge(size: 40),
+                title: Text('NaviUpload $kAppVersion',
+                    style: theme.textTheme.titleMedium),
+                subtitle: Text(
+                  'Upload music to your Navidrome library from files or '
+                  'URLs.',
+                  style: theme.textTheme.bodyMedium,
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.code),
+                title: const Text('GitHub repository'),
+                subtitle: const Text('github.com/c12n/navidrome-uploader'),
+                trailing: const Icon(Icons.open_in_new, size: 20),
+                onTap: () async {
+                  try {
+                    await Process.run(
+                        'cmd',
+                        [
+                          '/c',
+                          'start',
+                          '',
+                          'https://github.com/c12n/navidrome-uploader'
+                        ],
+                        runInShell: true);
+                  } catch (_) {
+                    if (mounted) _snack('Could not open the browser.');
+                  }
+                },
+              ),
+            ],
           ),
         ),
       ],
