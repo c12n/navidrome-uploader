@@ -1,7 +1,7 @@
 name: naviupload_windows
 description: "NaviUpload for Windows — upload music directly to your Navidrome library from files or URLs, with the same big-type Material 3 look as Viu for Windows."
 publish_to: 'none'
-version: 0.6.0+11
+version: 1.4.0+12
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
@@ -14,6 +14,19 @@ dependencies:
   flutter_secure_storage: ^9.2.2
   file_picker: ^8.0.0
   desktop_drop: ^0.4.4
+  # Windows shell integration (1.4.0): tray icon + window lifecycle,
+  # taskbar progress, start-with-Windows, toast notifications,
+  # single-instance forwarding, Explorer menu registration, local
+  # tag reading for the tag editor (writes happen on the server),
+  # and SHA-256 for resumable-upload verification.
+  window_manager: ^0.5.1
+  tray_manager: ^0.5.2
+  windows_taskbar: ^1.1.2
+  flutter_local_notifications: ^23.0.1
+  audio_metadata_reader: ^1.8.1
+  crypto: ^3.0.8
+  windows_single_instance: '>=1.0.0 <1.2.0'
+  win32_registry: ^2.1.0
 
 dev_dependencies:
   flutter_test:
@@ -21,3 +34,7 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    # The tray icon: the same .ico the runner itself ships with,
+    # bundled as an asset so the tray can load it at runtime.
+    - windows_overlay/app_icon.ico

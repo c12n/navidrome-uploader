@@ -9,6 +9,38 @@ server as the iOS app: server address + upload token live in
 Settings, with a one-tap connection test against the server's
 `/health` endpoint.
 
+## What's new in 1.4.0 (Windows only)
+
+- **Resumable uploads**: files of 4 MB and up upload in chunks the
+  server keeps between requests, so an interrupted upload resumes
+  from the server's own byte count, even after the app restarts.
+  The server verifies the whole file's SHA-256 before saving it.
+- **CUE sheet albums**: drop a single-file album with its .cue
+  sheet beside it and the server splits it into tracks
+  (sample-exact for lossless sources).
+- **Playlist upload**: drop an .m3u and, once its songs are in,
+  a playlist with the same name is created in Navidrome.
+- **Tag fixer**: with "Review tags before uploading" on in
+  Settings, each batch pauses in a tag editor (title, artist,
+  album, year, track, replacement cover). Edits are applied by
+  the server to the copies it saves; your own files are never
+  rewritten.
+- **System tray**: closing the window parks the app in the tray
+  while uploads keep running; the tray tooltip shows progress.
+  Optional start with Windows, hidden in the tray.
+- **Explorer right-click**: "Send to Navidrome" on audio files,
+  folders and .cue/.m3u/.zip files (a Settings toggle). A second
+  launch hands its files to the running copy instead of opening
+  another window; `--add <path>` and `--url <link>` do the same
+  from the command line.
+- **Watch folder**: new files in a chosen folder upload
+  automatically once they finish copying. Files already in the
+  folder when it is first chosen are not uploaded.
+- **Notifications and taskbar progress**: a toast when a batch
+  finishes, and progress on the taskbar button while uploading.
+- Drag and drop now works anywhere on the window, not just on
+  the drop zone.
+
 ## Design
 
 Built to look like its sibling, Viu for Windows — the user asked for

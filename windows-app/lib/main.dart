@@ -20,8 +20,16 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:audio_metadata_reader/audio_metadata_reader.dart';
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:tray_manager/tray_manager.dart';
+import 'package:win32_registry/win32_registry.dart';
+import 'package:window_manager/window_manager.dart';
+import 'package:windows_single_instance/windows_single_instance.dart';
+import 'package:windows_taskbar/windows_taskbar.dart';
 
 // ---------------------------------------------------------------------------
 // Accents (Viu's curated set, reordered: Navi Blue first / default)
@@ -49,7 +57,7 @@ const List<String> kAudioExtensions = [
 
 /// This build's marketing version (kept in step with pubspec.yaml;
 /// the update checker compares it against GitHub's latest release).
-const String kAppVersion = '0.6.0';
+const String kAppVersion = '1.4.0';
 
 /// Numeric dotted-version compare: is [candidate] newer than
 /// [current]? ("0.10.0" > "0.9.9")
@@ -114,7 +122,19 @@ class ApiException implements Exception {
 class HealthResult {
   final int libraryFiles;
   final bool scanConfigured;
-  const HealthResult({required this.libraryFiles, required this.scanConfigured});
+  // Server feature flags (1.4.0): what this server build can do.
+  final bool chunkedUploads;
+  final bool playlists;
+  final bool cueSplit;
+  final int chunkSize;
+  const HealthResult({
+    required this.libraryFiles,
+    required this.scanConfigured,
+    this.chunkedUploads = false,
+    this.playlists = false,
+    this.cueSplit = false,
+    this.chunkSize = 8 * 1024 * 1024,
+  });
 }
 
 class UploadResult {
@@ -468,6 +488,32 @@ class AppState extends ChangeNotifier {
   bool sortFolders = false;
   bool skipDuplicates = true;
 
+  // Windows shell preferences (1.4.0).
+  bool trayEnabled = true;
+  bool startWithWindows = false;
+  bool explorerMenu = false;
+  bool notificationsEnabled = true;
+  bool watchFolderEnabled = false;
+  String watchFolderPath = '';
+  bool reviewTags = false;
+
+  // Files the watch folder has already handed over, keyed
+  // "path|size|mtimeMs": a replaced file (different size or
+  // timestamp) is picked up again, the same file never is.
+  Set<String> watchSeen = {};
+  Set<String> watchBaselined = {};
+
+  // Resumable-upload sessions the server is holding for us, keyed
+  // "path|size|mtimeMs" -> upload id, so a restarted app picks a
+  // half-sent album up where it stopped.
+  Map<String, String> chunkSessions = {};
+
+  // What the last /health said this server can do (1.4.0 features).
+  bool serverChunked = false;
+  bool serverPlaylists = false;
+  bool serverCue = false;
+  int serverChunkSize = 8 * 1024 * 1024;
+
   Accent get accent => kAccents[accentIndex.clamp(0, kAccents.length - 1)];
 
   ThemeMode get themeMode => switch (appearanceMode) {
@@ -500,6 +546,28 @@ class AppState extends ChangeNotifier {
     embedLyrics = prefs.getBool('processing.embedLyrics') ?? true;
     sortFolders = prefs.getBool('processing.sortFolders') ?? false;
     skipDuplicates = prefs.getBool('processing.skipDuplicates') ?? true;
+    trayEnabled = prefs.getBool('windows.tray') ?? true;
+    startWithWindows = prefs.getBool('windows.startWithWindows') ?? false;
+    explorerMenu = prefs.getBool('windows.explorerMenu') ?? false;
+    notificationsEnabled = prefs.getBool('windows.notifications') ?? true;
+    watchFolderEnabled = prefs.getBool('windows.watchEnabled') ?? false;
+    watchFolderPath = prefs.getString('windows.watchPath') ?? '';
+    reviewTags = prefs.getBool('windows.reviewTags') ?? false;
+    watchSeen = (prefs.getStringList('windows.watchSeen') ?? []).toSet();
+    watchBaselined =
+        (prefs.getStringList('windows.watchBaselined') ?? []).toSet();
+    final rawSessions = prefs.getString('windows.chunkSessions');
+    if (rawSessions != null) {
+      try {
+        final decoded = jsonDecode(rawSessions);
+        if (decoded is Map) {
+          chunkSessions = decoded.map(
+              (k, v) => MapEntry(k.toString(), v.toString()));
+        }
+      } catch (_) {
+        chunkSessions = {};
+      }
+    }
     token = await _secure.read(key: 'upload_token');
     torboxKey = await _secure.read(key: 'torbox_api_key');
     premiumizeKey = await _secure.read(key: 'premiumize_api_key');
@@ -611,6 +679,88 @@ class AppState extends ChangeNotifier {
     await _prefs?.setBool('processing.skipDuplicates', v);
   }
 
+  // --- Windows shell (1.4.0) ---------------------------------------
+
+  Future<void> setTrayEnabled(bool v) async {
+    trayEnabled = v;
+    notifyListeners();
+    await _prefs?.setBool('windows.tray', v);
+    await applyTraySetting();
+  }
+
+  Future<void> setStartWithWindows(bool v) async {
+    startWithWindows = v;
+    notifyListeners();
+    await _prefs?.setBool('windows.startWithWindows', v);
+    await applyStartupSetting();
+  }
+
+  Future<void> setExplorerMenu(bool v) async {
+    explorerMenu = v;
+    notifyListeners();
+    await _prefs?.setBool('windows.explorerMenu', v);
+    await setExplorerMenuRegistration(v);
+  }
+
+  Future<void> setNotificationsEnabled(bool v) async {
+    notificationsEnabled = v;
+    notifyListeners();
+    await _prefs?.setBool('windows.notifications', v);
+  }
+
+  Future<void> setWatchFolderEnabled(bool v) async {
+    watchFolderEnabled = v;
+    notifyListeners();
+    await _prefs?.setBool('windows.watchEnabled', v);
+  }
+
+  Future<void> setWatchFolderPath(String v) async {
+    watchFolderPath = v;
+    notifyListeners();
+    await _prefs?.setString('windows.watchPath', v);
+  }
+
+  Future<void> setReviewTags(bool v) async {
+    reviewTags = v;
+    notifyListeners();
+    await _prefs?.setBool('windows.reviewTags', v);
+  }
+
+  /// Baseline a newly watched folder: mark everything currently
+  /// in it as seen WITHOUT uploading it, and remember the folder
+  /// as baselined so only files that arrive later ever upload.
+  Future<void> baselineWatchFolder(String path, Set<String> keys) async {
+    if (watchBaselined.contains(path)) return;
+    watchBaselined = {...watchBaselined, path};
+    await _prefs?.setStringList(
+        'windows.watchBaselined', watchBaselined.toList());
+    await markWatchSeen(keys);
+  }
+
+  Future<void> markWatchSeen(Set<String> keys) async {
+    if (keys.isEmpty) return;
+    watchSeen = {...watchSeen, ...keys};
+    // Cap the remembered set so it cannot grow forever; the oldest
+    // entries are the ones least likely to matter.
+    if (watchSeen.length > 5000) {
+      watchSeen = watchSeen.skip(watchSeen.length - 5000).toSet();
+    }
+    await _prefs?.setStringList('windows.watchSeen', watchSeen.toList());
+  }
+
+  String? chunkSessionFor(String key) => chunkSessions[key];
+
+  Future<void> saveChunkSession(String key, String uploadId) async {
+    chunkSessions = {...chunkSessions, key: uploadId};
+    await _prefs?.setString('windows.chunkSessions', jsonEncode(chunkSessions));
+  }
+
+  Future<void> clearChunkSession(String key) async {
+    if (!chunkSessions.containsKey(key)) return;
+    chunkSessions = {...chunkSessions}..remove(key);
+    await _prefs?.setString('windows.chunkSessions', jsonEncode(chunkSessions));
+  }
+
   Future<void> _saveHistory() async {
     await _prefs?.setString(
       'naviupload_history',
@@ -712,6 +862,10 @@ class AppState extends ChangeNotifier {
     try {
       final h = await api.health();
       lastHealth = h;
+      serverChunked = h.chunkedUploads;
+      serverPlaylists = h.playlists;
+      serverCue = h.cueSplit;
+      if (h.chunkSize > 0) serverChunkSize = h.chunkSize;
       healthError = null;
       lastHealthAt = DateTime.now();
       // /health is public — also probe an authenticated endpoint so a
@@ -739,6 +893,329 @@ class AppState extends ChangeNotifier {
 }
 
 final AppState appState = AppState();
+
+/// Paths handed to this instance from outside the UI: a second
+/// launch (Explorer right-click "Send to Navidrome", a double-click
+/// while the app sits in the tray, command-line --add) or a drop
+/// anywhere on the window. The upload page consumes them through the
+/// same _addPaths flow as its own picker, so sidecars, duplicate
+/// checks and playlists behave identically however files arrive.
+final StreamController<List<String>> inboundPaths =
+    StreamController<List<String>>.broadcast();
+final StreamController<List<String>> inboundUrls =
+    StreamController<List<String>>.broadcast();
+
+/// Ask the running window to come to the front (a second launch with
+/// nothing to add, or the tray's Open item).
+final StreamController<void> inboundShow =
+    StreamController<void>.broadcast();
+
+/// True while a file drag hovers anywhere over the window.
+final ValueNotifier<bool> dragHover = ValueNotifier<bool>(false);
+
+/// One-line queue summary mirrored into the tray tooltip.
+final ValueNotifier<String> trayStatus =
+    ValueNotifier<String>('NaviUpload');
+
+// ---------------------------------------------------------------------------
+// Windows shell integration (1.4.0): tray icon, single-instance
+// hand-off, Explorer right-click verb, start-with-Windows entry,
+// taskbar progress and toast notifications. The Dart side is one
+// half; the other (window class, first-frame show) is the generated
+// runner, patched by windows_overlay/patch_windows.py as before.
+// ---------------------------------------------------------------------------
+
+/// Fixed identity for Windows toast notifications. The AUMID and
+/// GUID are chosen once and must never change, or Windows stops
+/// routing toast clicks back to this app.
+const String kToastAppUserModelId = 'c12n.NaviUpload';
+const String kToastGuid = 'f5bd8dff-4533-4fde-b872-2e6994d60686';
+
+final FlutterLocalNotificationsPlugin _notifications =
+    FlutterLocalNotificationsPlugin();
+bool _toastsReady = false;
+
+Future<void> _initToasts() async {
+  if (!Platform.isWindows) return;
+  try {
+    _toastsReady = await _notifications.initialize(
+          settings: const InitializationSettings(
+            windows: WindowsInitializationSettings(
+              appName: 'NaviUpload',
+              appUserModelId: kToastAppUserModelId,
+              guid: kToastGuid,
+            ),
+          ),
+          onDidReceiveNotificationResponse: (_) {
+            inboundShow.add(null);
+          },
+        ) ??
+        false;
+  } catch (_) {
+    _toastsReady = false;
+  }
+}
+
+/// Toast when a queue run finishes (Settings can switch these off).
+Future<void> showUploadToast({required int done, required int failed}) async {
+  if (!Platform.isWindows || !appState.notificationsEnabled || !_toastsReady) {
+    return;
+  }
+  final body = failed > 0
+      ? '$done uploaded, $failed failed'
+      : done == 1
+          ? '1 song uploaded to your Navidrome library'
+          : '$done songs uploaded to your Navidrome library';
+  try {
+    await _notifications.show(
+      id: 1,
+      title: 'NaviUpload',
+      body: body,
+      notificationDetails: const NotificationDetails(
+        windows: WindowsNotificationDetails(),
+      ),
+    );
+  } catch (_) {
+    // A failed toast must never disturb the queue.
+  }
+}
+
+Future<void> setTaskbarProgress(int finished, int total) async {
+  if (!Platform.isWindows || total <= 0) return;
+  try {
+    await WindowsTaskbar.setProgressMode(TaskbarProgressMode.normal);
+    await WindowsTaskbar.setProgress(finished, total);
+  } catch (_) {
+    // Taskbar progress is decoration only.
+  }
+}
+
+Future<void> resetTaskbarProgress() async {
+  if (!Platform.isWindows) return;
+  try {
+    await WindowsTaskbar.setProgressMode(TaskbarProgressMode.noProgress);
+  } catch (_) {}
+}
+
+Future<void> showAppWindow() async {
+  try {
+    await windowManager.show();
+    await windowManager.focus();
+  } catch (_) {}
+}
+
+Future<void> _quitApp() async {
+  try {
+    await trayManager.destroy();
+  } catch (_) {}
+  try {
+    await windowManager.setPreventClose(false);
+    await windowManager.destroy();
+  } catch (_) {}
+}
+
+/// Tray and window events. Closing the window parks the app in
+/// the tray while the tray is enabled (uploads keep running);
+/// Quit lives in the tray menu, and closing quits outright when
+/// the tray is off.
+class _ShellHandler with TrayListener, WindowListener {
+  @override
+  void onWindowClose() {
+    if (appState.trayEnabled) {
+      unawaited(windowManager.hide());
+    } else {
+      unawaited(_quitApp());
+    }
+  }
+
+  @override
+  void onTrayIconMouseDown() {
+    unawaited(showAppWindow());
+  }
+
+  @override
+  void onTrayIconRightMouseDown() {
+    unawaited(trayManager.popUpContextMenu());
+  }
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) {
+    if (menuItem.key == 'show') {
+      unawaited(showAppWindow());
+    } else if (menuItem.key == 'quit') {
+      unawaited(_quitApp());
+    }
+  }
+}
+
+final _ShellHandler _shellHandler = _ShellHandler();
+
+void _syncTrayTip() {
+  if (!Platform.isWindows || !appState.trayEnabled) return;
+  unawaited(() async {
+    try {
+      await trayManager.setToolTip(trayStatus.value);
+    } catch (_) {}
+  }());
+}
+
+/// Apply the tray setting: build the icon and menu, or remove the
+/// icon entirely.
+Future<void> applyTraySetting() async {
+  if (!Platform.isWindows) return;
+  try {
+    if (!appState.trayEnabled) {
+      await trayManager.destroy();
+      return;
+    }
+    await trayManager.setIcon('windows_overlay/app_icon.ico');
+    await trayManager.setToolTip(trayStatus.value);
+    await trayManager.setContextMenu(Menu(items: [
+      MenuItem(key: 'show', label: 'Open NaviUpload'),
+      MenuItem.separator(),
+      MenuItem(key: 'quit', label: 'Quit'),
+    ]));
+  } catch (_) {
+    // The tray is a convenience; it must never break startup.
+  }
+}
+
+/// Apply the start-with-Windows setting: the per-user Run key,
+/// rewritten on every launch while enabled because the app lives
+/// in a zip folder the user can move.
+Future<void> applyStartupSetting() async {
+  if (!Platform.isWindows) return;
+  try {
+    final key = Registry.openPath(
+      RegistryHive.currentUser,
+      path: r'Software\Microsoft\Windows\CurrentVersion\Run',
+      desiredAccessRights: AccessRights.allAccess,
+    );
+    try {
+      if (appState.startWithWindows) {
+        key.createValue(RegistryValue.string(
+            'NaviUpload', '"${Platform.resolvedExecutable}" --minimized'));
+      } else {
+        try {
+          key.deleteValue('NaviUpload');
+        } catch (_) {
+          // Already absent.
+        }
+      }
+    } finally {
+      key.close();
+    }
+  } catch (_) {}
+}
+
+/// Open (creating as needed) a key path under HKCU, one level at a
+/// time — RegOpenKeyEx cannot create, and createKey only nests one
+/// level under an open key.
+RegistryKey _openOrCreatePath(List<String> parts) {
+  var key = Registry.openPath(RegistryHive.currentUser,
+      desiredAccessRights: AccessRights.allAccess);
+  for (final part in parts) {
+    final next = key.createKey(part);
+    key.close();
+    key = next;
+  }
+  return key;
+}
+
+/// Register or remove the Explorer right-click verb "Send to
+/// Navidrome". Scoped deliberately (design review): the shared
+/// audio association, the .cue/.m3u/.m3u8/.zip extensions, and
+/// folders — not every file type. Per-user (HKCU), so no admin
+/// rights; re-registering on launch keeps the stored exe path
+/// correct when the zip folder moves.
+Future<void> setExplorerMenuRegistration(bool enabled) async {
+  if (!Platform.isWindows) return;
+  const roots = <List<String>>[
+    ['Software', 'Classes', 'SystemFileAssociations', 'audio', 'shell'],
+    ['Software', 'Classes', '.cue', 'shell'],
+    ['Software', 'Classes', '.m3u', 'shell'],
+    ['Software', 'Classes', '.m3u8', 'shell'],
+    ['Software', 'Classes', '.zip', 'shell'],
+    ['Software', 'Classes', 'Directory', 'shell'],
+  ];
+  try {
+    for (final parts in roots) {
+      final shell = _openOrCreatePath(parts);
+      try {
+        if (enabled) {
+          final verb = shell.createKey('NaviUpload');
+          try {
+            verb.createValue(RegistryValue.string('', 'Send to Navidrome'));
+            verb.createValue(
+                RegistryValue.string('MultiSelectModel', 'Player'));
+            verb.createValue(RegistryValue.string(
+                'Icon', '"${Platform.resolvedExecutable}",0'));
+            final command = verb.createKey('command');
+            try {
+              command.createValue(RegistryValue.string(
+                  '', '"${Platform.resolvedExecutable}" --add "%1"'));
+            } finally {
+              command.close();
+            }
+          } finally {
+            verb.close();
+          }
+        } else {
+          try {
+            shell.deleteKey('NaviUpload', recursive: true);
+          } catch (_) {
+            // Already gone.
+          }
+        }
+      } finally {
+        shell.close();
+      }
+    }
+  } catch (_) {
+    // Shell integration is best-effort.
+  }
+}
+
+/// Split a launch command line into what the app should do with
+/// it: paths to queue (--add values and bare positional paths),
+/// URLs (--url values) and whether to start hidden (--minimized,
+/// how the start-with-Windows entry launches).
+({List<String> paths, List<String> urls, bool minimized}) parseInboundArgs(
+    List<String> args) {
+  final paths = <String>[];
+  final urls = <String>[];
+  var minimized = false;
+  var mode = '';
+  for (final arg in args) {
+    if (arg == '--minimized') {
+      minimized = true;
+      mode = '';
+    } else if (arg == '--add') {
+      mode = 'add';
+    } else if (arg == '--url') {
+      mode = 'url';
+    } else if (arg.startsWith('--')) {
+      mode = '';
+    } else if (mode == 'url' || (mode == '' && arg.contains('://'))) {
+      urls.add(arg);
+      mode = '';
+    } else {
+      paths.add(arg);
+      mode = '';
+    }
+  }
+  return (paths: paths, urls: urls, minimized: minimized);
+}
+
+/// Route one launch's arguments into the running app. Any second
+/// launch also raises the window — that is what a double-click on
+/// the exe while the app sits in the tray means.
+void handleInboundArgs(List<String> args, {bool raise = true}) {
+  final parsed = parseInboundArgs(args);
+  if (parsed.urls.isNotEmpty) inboundUrls.add(parsed.urls);
+  if (parsed.paths.isNotEmpty) inboundPaths.add(parsed.paths);
+  if (raise) inboundShow.add(null);
+}
 
 // ---------------------------------------------------------------------------
 // API client for the NaviUpload companion server
@@ -830,6 +1307,8 @@ class NaviApi {
     try {
       final decoded = jsonDecode(r.body);
       if (decoded is Map) {
+        final features = decoded['features'];
+        final f = features is Map ? features : const {};
         return HealthResult(
           libraryFiles:
               (decoded['library_files'] as num?)?.toInt() ??
@@ -837,6 +1316,11 @@ class NaviApi {
                   0,
           scanConfigured: decoded['scan_configured'] == true ||
               decoded['scanConfigured'] == true,
+          chunkedUploads: f['chunked_uploads'] == true,
+          playlists: f['playlists'] == true,
+          cueSplit: f['cue_split'] == true,
+          chunkSize: (decoded['chunk_size'] as num?)?.toInt() ??
+              8 * 1024 * 1024,
         );
       }
     } catch (_) {
@@ -857,6 +1341,7 @@ class NaviApi {
     bool sort = false,
     File? cover,
     File? lyricsFile,
+    Map<String, String>? tagOverrides,
     required void Function(double progress) onProgress,
   }) async {
     final fileLength = await file.length();
@@ -876,6 +1361,9 @@ class NaviApi {
     String formField(String name, bool value) => '--$boundary\r\n'
         'Content-Disposition: form-data; name="$name"\r\n\r\n'
         '${value ? 'true' : 'false'}\r\n';
+    String textField(String name, String value) => '--$boundary\r\n'
+        'Content-Disposition: form-data; name="$name"\r\n\r\n'
+        '$value\r\n';
     String partHeader(String field, String filename) => '--$boundary\r\n'
         'Content-Disposition: form-data; name="$field"; '
         'filename="${safe(filename)}"\r\n'
@@ -886,8 +1374,14 @@ class NaviApi {
     final headerBuffer = StringBuffer()
       ..write(formField('enrich', enrich))
       ..write(formField('lyrics', lyrics))
-      ..write(formField('sort', sort))
-      ..write(partHeader('file', safeName));
+      ..write(formField('sort', sort));
+    // Tag fixer edits (1.4.0) ride as one JSON form field; the
+    // server applies them to the library copy after saving.
+    if (tagOverrides != null && tagOverrides.isNotEmpty) {
+      headerBuffer
+          .write(textField('tag_overrides', jsonEncode(tagOverrides)));
+    }
+    headerBuffer.write(partHeader('file', safeName));
     final header = utf8.encode(headerBuffer.toString());
     final footer = utf8.encode('\r\n--$boundary--\r\n');
 
@@ -987,6 +1481,307 @@ class NaviApi {
   }
 
   /// Ask Navidrome (through the server) to rescan the library now.
+  // --- Chunked (resumable) uploads (1.4.0) -------------------------
+
+  Future<({String id, int chunkSize})> chunkInit(
+      String filename, int size) async {
+    final r = await http
+        .post(_uri('/upload/init'),
+            headers: {..._authHeaders, 'Content-Type': 'application/json'},
+            body: jsonEncode({'filename': filename, 'size': size}))
+        .timeout(const Duration(seconds: 30));
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    final decoded = jsonDecode(r.body);
+    if (decoded is Map && decoded['upload_id'] != null) {
+      return (
+        id: decoded['upload_id'].toString(),
+        chunkSize: (decoded['chunk_size'] as num?)?.toInt() ?? 8 * 1024 * 1024,
+      );
+    }
+    throw const ApiException('The server answered with an unreadable reply.');
+  }
+
+  /// How many bytes of this session the server actually holds —
+  /// and, once a complete has landed, its stored result.
+  Future<({int received, String state, Map<String, dynamic>? result})>
+      chunkStatus(String uploadId) async {
+    final r = await http
+        .get(_uri('/upload/status?upload_id=$uploadId'),
+            headers: _authHeaders)
+        .timeout(const Duration(seconds: 30));
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    final decoded = jsonDecode(r.body);
+    if (decoded is Map) {
+      final result = decoded['result'];
+      return (
+        received: (decoded['received'] as num?)?.toInt() ?? 0,
+        state: (decoded['state'] ?? 'receiving').toString(),
+        result: result is Map<String, dynamic> ? result : null,
+      );
+    }
+    throw const ApiException('The server answered with an unreadable reply.');
+  }
+
+  Future<int> chunkPut(String uploadId, int offset, List<int> bytes) async {
+    final r = await http
+        .put(_uri('/upload/chunk?upload_id=$uploadId&offset=$offset'),
+            headers: {
+              ..._authHeaders,
+              'Content-Type': 'application/octet-stream',
+            },
+            body: bytes)
+        .timeout(const Duration(minutes: 3));
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    final decoded = jsonDecode(r.body);
+    if (decoded is Map) {
+      return (decoded['received'] as num?)?.toInt() ?? offset + bytes.length;
+    }
+    return offset + bytes.length;
+  }
+
+  Future<UploadResult> chunkComplete(
+    String uploadId, {
+    required bool enrich,
+    required bool lyrics,
+    required bool sort,
+    String? cueText,
+    String? sha256,
+    Map<String, String>? tagOverrides,
+    String? coverB64,
+    String? lyricsB64,
+  }) async {
+    // No timeout: completing can mean splitting a cue album and
+    // enriching every track, which legitimately takes minutes.
+    final r = await http.post(_uri('/upload/complete'),
+        headers: {..._authHeaders, 'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'upload_id': uploadId,
+          'enrich': enrich,
+          'lyrics': lyrics,
+          'sort': sort,
+          if (cueText != null) 'cue': cueText,
+          if (sha256 != null) 'sha256': sha256,
+          if (tagOverrides != null) 'tag_overrides': tagOverrides,
+          if (coverB64 != null) 'cover_b64': coverB64,
+          if (lyricsB64 != null) 'lyrics_b64': lyricsB64,
+        }));
+    return _parseUpload(r);
+  }
+
+  Future<void> chunkCancel(String uploadId) async {
+    try {
+      await http
+          .delete(_uri('/upload/session?upload_id=$uploadId'),
+              headers: _authHeaders)
+          .timeout(const Duration(seconds: 15));
+    } catch (_) {
+      // Best effort: an un-cancelled session expires on its own.
+    }
+  }
+
+  static Future<List<int>> _readUpTo(RandomAccessFile raf, int want) async {
+    final out = <int>[];
+    var remaining = want;
+    while (remaining > 0) {
+      final step = remaining > 1024 * 1024 ? 1024 * 1024 : remaining;
+      final block = await raf.read(step);
+      if (block.isEmpty) break;
+      out.addAll(block);
+      remaining -= block.length;
+    }
+    return out;
+  }
+
+  /// Upload [file] in chunks the server keeps between requests, so
+  /// an interrupted upload resumes from the server's own byte count
+  /// instead of starting over — even across app restarts, because
+  /// the session id is persisted per file (path + size + mtime).
+  /// The whole file's SHA-256 rides the complete call, so the
+  /// server saves the song only when the assembled bytes are
+  /// provably the file on this disk.
+  Future<UploadResult> uploadFileChunked(
+    File file,
+    String displayName, {
+    bool enrich = false,
+    bool lyrics = false,
+    bool sort = false,
+    String? cueText,
+    Map<String, String>? tagOverrides,
+    String? coverB64,
+    String? lyricsB64,
+    required void Function(double progress) onProgress,
+  }) async {
+    final size = await file.length();
+    final mtime = (await file.lastModified()).millisecondsSinceEpoch;
+    final key = '${file.path}|$size|$mtime';
+    var chunkSize = appState.serverChunkSize;
+    String? uploadId = appState.chunkSessionFor(key);
+    var received = 0;
+    if (uploadId != null) {
+      try {
+        final st = await chunkStatus(uploadId);
+        // A complete whose response was lost left a receipt on the
+        // server: the upload already finished, so hand back its
+        // stored result instead of sending the file again.
+        if (st.state == 'done' && st.result != null) {
+          await appState.clearChunkSession(key);
+          onProgress(1);
+          return UploadResult.fromJson(st.result!);
+        }
+        received = st.received;
+        if (received < 0 || received > size) {
+          received = 0;
+          uploadId = null;
+        }
+      } catch (_) {
+        uploadId = null;
+        received = 0;
+      }
+    }
+    if (uploadId == null) {
+      final init = await chunkInit(displayName, size);
+      uploadId = init.id;
+      chunkSize = init.chunkSize;
+      received = 0;
+      await appState.saveChunkSession(key, uploadId);
+    }
+    final id = uploadId;
+    // Hash the file once, up front: one extra local read, and the
+    // digest stays correct no matter how the chunks below retry
+    // or resume.
+    final digest = await crypto.sha256.bind(file.openRead()).first;
+    final sha256Hex =
+        digest.bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    onProgress(size == 0 ? 0 : received / size);
+    final raf = await file.open();
+    try {
+      var offset = received;
+      while (offset < size) {
+        await raf.setPosition(offset);
+        final want =
+            chunkSize < size - offset ? chunkSize : size - offset;
+        var bytes = await _readUpTo(raf, want);
+        if (bytes.isEmpty) {
+          throw const ApiException('Could not read the file to upload it.');
+        }
+        // Up to three attempts per chunk. After a failure the
+        // server's own count decides where things really stand: a
+        // chunk whose reply got lost may have landed fine, and a
+        // rolled-back chunk must be re-read from the true offset.
+        var attempt = 0;
+        while (true) {
+          attempt++;
+          try {
+            offset = await chunkPut(id, offset, bytes);
+            break;
+          } catch (e) {
+            if (attempt >= 3) rethrow;
+            await Future<void>.delayed(const Duration(seconds: 1));
+            var truth = offset;
+            try {
+              truth = (await chunkStatus(id)).received;
+            } catch (_) {
+              // Keep the local offset and just retry the chunk.
+            }
+            if (truth == offset + bytes.length) {
+              offset = truth;
+              break;
+            }
+            if (truth != offset) {
+              offset = truth;
+              await raf.setPosition(offset);
+              final again = await _readUpTo(
+                  raf, chunkSize < size - offset ? chunkSize : size - offset);
+              if (again.isEmpty) {
+                throw const ApiException(
+                    'Could not read the file to upload it.');
+              }
+              bytes = again;
+            }
+          }
+        }
+        onProgress(size == 0 ? 1 : offset / size);
+      }
+    } finally {
+      await raf.close();
+    }
+    // If the file changed on disk mid-upload, the session no
+    // longer describes it: drop the session and say so, rather
+    // than letting the server save a mix of two versions.
+    final nowSize = await file.length();
+    final nowMtime = (await file.lastModified()).millisecondsSinceEpoch;
+    if (nowSize != size || nowMtime != mtime) {
+      await chunkCancel(id);
+      await appState.clearChunkSession(key);
+      throw const ApiException(
+          'The file changed while it was uploading; add it again.');
+    }
+    final res = await chunkComplete(id,
+        enrich: enrich,
+        lyrics: lyrics,
+        sort: sort,
+        cueText: cueText,
+        sha256: sha256Hex,
+        tagOverrides: tagOverrides,
+        coverB64: coverB64,
+        lyricsB64: lyricsB64);
+    await appState.clearChunkSession(key);
+    return res;
+  }
+
+  // --- Playlists (1.4.0) --------------------------------------------
+
+  /// Ask the server to create a Navidrome playlist from track
+  /// titles/artists (an .m3u's contents, after the files themselves
+  /// were uploaded). Returns how many songs Navidrome matched and
+  /// which ones it could not find.
+  Future<({int matched, List<String> missing})> createPlaylist(
+      String name,
+      List<({String title, String artist, int? duration})> songs) async {
+    final r = await http
+        .post(_uri('/playlists'),
+            headers: {..._authHeaders, 'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'name': name,
+              'songs': [
+                for (final s in songs)
+                  {
+                    'title': s.title,
+                    'artist': s.artist,
+                    if (s.duration != null) 'duration': s.duration,
+                  }
+              ],
+            }))
+        .timeout(const Duration(minutes: 5));
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw ApiException(_serverMessage(r));
+    }
+    final decoded = jsonDecode(r.body);
+    if (decoded is Map) {
+      final missing = decoded['missing'];
+      return (
+        matched: (decoded['matched'] as num?)?.toInt() ?? 0,
+        missing: missing is List
+            ? [
+                for (final m in missing)
+                  if (m is Map)
+                    '${m['artist'] ?? ''} - ${m['title'] ?? ''}'
+                        .replaceAll(RegExp(r'^ - | - $'), '')
+                  else
+                    m.toString(),
+              ]
+            : const <String>[],
+      );
+    }
+    throw const ApiException('The server answered with an unreadable reply.');
+  }
+
   Future<ScanResult> scanLibrary() async {
     final http.Response r;
     try {
@@ -1257,10 +2052,47 @@ TextTheme _textTheme(Brightness brightness) {
   );
 }
 
-Future<void> main() async {
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isWindows) {
+    // One running instance: a second launch (the Explorer verb, a
+    // double-click while the app sits in the tray) forwards its
+    // arguments to the instance already running and exits.
+    await WindowsSingleInstance.ensureSingleInstance(
+      args,
+      'c12n.naviupload',
+      onSecondWindow: (secondArgs) => handleInboundArgs(secondArgs),
+    );
+    await windowManager.ensureInitialized();
+    windowManager.addListener(_shellHandler);
+    trayManager.addListener(_shellHandler);
+  }
   runApp(const NaviUploadApp());
-  unawaited(appState.boot());
+  unawaited(_initShell(args));
+}
+
+/// After the first frame: load settings, then wire up the shell
+/// pieces that depend on them, refresh the registry entries whose
+/// stored exe path may have gone stale, and only then hand this
+/// launch's own arguments to the pages (which subscribe during the
+/// first build, so nothing is dropped).
+Future<void> _initShell(List<String> args) async {
+  await appState.boot();
+  if (!Platform.isWindows) return;
+  final parsed = parseInboundArgs(args);
+  await windowManager.setPreventClose(true);
+  trayStatus.addListener(_syncTrayTip);
+  unawaited(applyTraySetting());
+  unawaited(_initToasts());
+  if (appState.startWithWindows) unawaited(applyStartupSetting());
+  if (appState.explorerMenu) {
+    unawaited(setExplorerMenuRegistration(true));
+  }
+  inboundShow.stream.listen((_) => unawaited(showAppWindow()));
+  if (parsed.minimized && appState.trayEnabled) {
+    await windowManager.hide();
+  }
+  handleInboundArgs(args, raise: !parsed.minimized);
 }
 
 class NaviUploadApp extends StatelessWidget {
@@ -1427,14 +2259,28 @@ class _HomeShellState extends State<HomeShell> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Scaffold(
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 18, 20, 10),
-            child: Row(
+    final scheme = theme.colorScheme;
+    // The whole window is a drop target (1.4.0): files dropped on
+    // any tab land in the upload queue, with a full-window hint
+    // while the drag hovers.
+    return DropTarget(
+      onDragEntered: (_) => dragHover.value = true,
+      onDragExited: (_) => dragHover.value = false,
+      onDragDone: (details) {
+        dragHover.value = false;
+        final paths = [for (final f in details.files) f.path];
+        if (paths.isNotEmpty) inboundPaths.add(paths);
+      },
+      child: Scaffold(
+        body: Stack(
+          children: [
+            Column(
               children: [
-                const AppIconBadge(),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 10),
+                  child: Row(
+                    children: [
+                      const AppIconBadge(),
                 const SizedBox(width: 16),
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -1499,8 +2345,29 @@ class _HomeShellState extends State<HomeShell> {
                 );
               },
             ),
-          ),
-        ],
+            ),
+              ],
+            ),
+            ValueListenableBuilder<bool>(
+              valueListenable: dragHover,
+              builder: (context, hovering, _) {
+                if (!hovering) return const SizedBox.shrink();
+                return Positioned.fill(
+                  child: IgnorePointer(
+                    child: Container(
+                      color: scheme.primary.withValues(alpha: 0.10),
+                      alignment: Alignment.center,
+                      child: Text(
+                        'Drop to add to the upload queue',
+                        style: theme.textTheme.headlineSmall,
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1545,6 +2412,24 @@ class QueueItem {
   // the server embeds them into the uploaded file.
   String? coverPath;
   String? lyricsPath;
+  // A cue sheet belonging to this file (1.4.0): the file is a
+  // single-file album and the server splits it into its tracks.
+  String? cueText;
+  String? cueName;
+  // Playlist membership (1.4.0): set when the file arrived via an
+  // .m3u — after the queue, the server builds this playlist in
+  // Navidrome from these titles.
+  String? playlistName;
+  String? playlistTitle;
+  String? playlistArtist;
+  int? playlistDuration;
+  // Tag fixer (1.4.0): edits from the review sheet. They are NOT
+  // written to this local file — the server applies them to the
+  // library copy with its own tag writer after the upload lands.
+  Map<String, String>? tagOverrides;
+  // A replacement cover picked in the review sheet; wins over the
+  // bundled sidecar cover on the server.
+  String? coverOverridePath;
 
   QueueItem({required this.name, required this.path, required this.size});
 }
@@ -1563,6 +2448,388 @@ class UrlItem {
   UrlItem(this.url);
 }
 
+/// One file on its way into the queue, with everything the add
+/// flow discovered about it (sidecars, cue sheet, playlist).
+class _PendingAdd {
+  final String path;
+  final String? coverPath;
+  final String? lyricsPath;
+  String? cueText;
+  String? cueName;
+  String? playlistName;
+  String? playlistTitle;
+  String? playlistArtist;
+  int? playlistDuration;
+  // Tag fixer results, filled in by the review sheet.
+  Map<String, String>? tagOverrides;
+  String? coverOverridePath;
+  _PendingAdd(this.path, this.coverPath, this.lyricsPath);
+}
+
+/// One line of an .m3u: a link or a (resolved, absolute) file path,
+/// with the #EXTINF artist/title when the playlist carried them.
+class _M3uEntry {
+  final String ref;
+  final String? title;
+  final String? artist;
+  final int? durationSeconds;
+  const _M3uEntry(this.ref, {this.title, this.artist, this.durationSeconds});
+  bool get isUrl => ref.startsWith('http://') || ref.startsWith('https://');
+}
+
+class _ParsedM3u {
+  final String name;
+  final List<_M3uEntry> entries;
+  const _ParsedM3u(this.name, this.entries);
+}
+
+// ---------------------------------------------------------------------------
+// Tag fixer (1.4.0): review and correct tags before a batch uploads.
+// Tags are READ locally; edits are never written to the user's files.
+// Each edit rides the upload as an override and the server applies it
+// to the copy it saves into the library.
+// ---------------------------------------------------------------------------
+
+class _TagEdit {
+  String title = '';
+  String artist = '';
+  String album = '';
+  String year = '';
+  String track = '';
+  // The values as read from the file, for change detection.
+  String oTitle = '';
+  String oArtist = '';
+  String oAlbum = '';
+  String oYear = '';
+  String oTrack = '';
+  Uint8List? coverBytes;
+  String? coverNote;
+  String? coverPick;
+  String? note;
+  bool loaded = false;
+}
+
+class TagReviewDialog extends StatefulWidget {
+  final List<_PendingAdd> files;
+  const TagReviewDialog({super.key, required this.files});
+
+  @override
+  State<TagReviewDialog> createState() => _TagReviewDialogState();
+}
+
+class _TagReviewDialogState extends State<TagReviewDialog> {
+  late final List<_TagEdit> _edits;
+  int _index = 0;
+  final _title = TextEditingController();
+  final _artist = TextEditingController();
+  final _album = TextEditingController();
+  final _year = TextEditingController();
+  final _track = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _edits = [for (var i = 0; i < widget.files.length; i++) _TagEdit()];
+    _load(0);
+    _pushCurrent();
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_title, _artist, _album, _year, _track]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  _PendingAdd get _pending => widget.files[_index];
+  _TagEdit get _edit => _edits[_index];
+
+  /// Read one file's tags (once). A file whose tags cannot be
+  /// parsed simply starts with empty fields.
+  void _load(int i) {
+    final edit = _edits[i];
+    if (edit.loaded) return;
+    edit.loaded = true;
+    final pending = widget.files[i];
+    try {
+      final meta = readMetadata(File(pending.path), getImage: true);
+      edit.title = meta.title ?? '';
+      edit.artist = meta.artist ?? '';
+      edit.album = meta.album ?? '';
+      edit.year = meta.year?.year.toString() ?? '';
+      edit.track = meta.trackNumber == null
+          ? ''
+          : '${meta.trackNumber}'
+              '${meta.trackTotal != null ? '/${meta.trackTotal}' : ''}';
+      if (meta.pictures.isNotEmpty) {
+        edit.coverBytes = meta.pictures.first.bytes;
+      }
+    } catch (_) {
+      edit.note = 'This file\'s tags could not be read.';
+    }
+    edit.oTitle = edit.title;
+    edit.oArtist = edit.artist;
+    edit.oAlbum = edit.album;
+    edit.oYear = edit.year;
+    edit.oTrack = edit.track;
+    // No embedded art: preview the sidecar cover the server will
+    // bundle with the song, if the add flow found one.
+    if (edit.coverBytes == null && pending.coverPath != null) {
+      try {
+        edit.coverBytes = File(pending.coverPath!).readAsBytesSync();
+        edit.coverNote = 'Cover from the image file beside the song.';
+      } catch (_) {
+        // Preview only — the upload still carries the sidecar.
+      }
+    }
+  }
+
+  void _saveCurrent() {
+    _edit.title = _title.text;
+    _edit.artist = _artist.text;
+    _edit.album = _album.text;
+    _edit.year = _year.text;
+    _edit.track = _track.text;
+  }
+
+  void _pushCurrent() {
+    _title.text = _edit.title;
+    _artist.text = _edit.artist;
+    _album.text = _edit.album;
+    _year.text = _edit.year;
+    _track.text = _edit.track;
+  }
+
+  void _goTo(int i) {
+    if (i < 0 || i >= widget.files.length || i == _index) return;
+    _saveCurrent();
+    setState(() {
+      _index = i;
+      _load(i);
+      _pushCurrent();
+    });
+  }
+
+  Future<void> _pickCover() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['jpg', 'jpeg', 'png'],
+      allowMultiple: false,
+      withData: false,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final path = result.files.single.path;
+    if (path == null || !mounted) return;
+    try {
+      final bytes = await File(path).readAsBytes();
+      if (!mounted) return;
+      setState(() {
+        _edit.coverPick = path;
+        _edit.coverBytes = bytes;
+        _edit.coverNote = 'New cover: ${baseName(path)}';
+      });
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('That image could not be read.')));
+      }
+    }
+  }
+
+  /// Album batches share artist, album and year: copy this file's
+  /// three fields onto every other file in the batch.
+  void _copyAlbumFieldsToAll() {
+    _saveCurrent();
+    for (var i = 0; i < _edits.length; i++) {
+      if (i == _index) continue;
+      _load(i);
+      _edits[i].artist = _edit.artist;
+      _edits[i].album = _edit.album;
+      _edits[i].year = _edit.year;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content:
+            Text('Artist, album and year copied to every file.')));
+  }
+
+  void _saveAndClose() {
+    _saveCurrent();
+    for (var i = 0; i < widget.files.length; i++) {
+      final edit = _edits[i];
+      final overrides = <String, String>{};
+      void put(String key, String value, String original) {
+        final v = value.trim();
+        if (v.isNotEmpty && v != original) overrides[key] = v;
+      }
+
+      put('title', edit.title, edit.oTitle);
+      put('artist', edit.artist, edit.oArtist);
+      put('album', edit.album, edit.oAlbum);
+      put('year', edit.year, edit.oYear);
+      put('track', edit.track, edit.oTrack);
+      widget.files[i].tagOverrides = overrides.isEmpty ? null : overrides;
+      if (edit.coverPick != null) {
+        widget.files[i].coverOverridePath = edit.coverPick;
+      }
+    }
+    Navigator.of(context).pop(true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final edit = _edit;
+    return AlertDialog(
+      title: const Text('Review tags'),
+      content: SizedBox(
+        width: 620,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'Edits apply to the copies saved into your library. '
+                'Your own files are not changed.',
+                style: theme.textTheme.bodySmall,
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.chevron_left),
+                    onPressed: _index > 0 ? () => _goTo(_index - 1) : null,
+                  ),
+                  Expanded(
+                    child: Text(
+                      '${_index + 1} of ${widget.files.length} — '
+                      '${baseName(_pending.path)}',
+                      style: theme.textTheme.titleSmall,
+                      textAlign: TextAlign.center,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.chevron_right),
+                    onPressed: _index < widget.files.length - 1
+                        ? () => _goTo(_index + 1)
+                        : null,
+                  ),
+                ],
+              ),
+              if (edit.note != null) ...[
+                const SizedBox(height: 4),
+                Text(edit.note!,
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: theme.colorScheme.error)),
+              ],
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 128,
+                    height: 128,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      color: theme.colorScheme.surfaceContainerHighest,
+                    ),
+                    clipBehavior: Clip.antiAlias,
+                    child: edit.coverBytes != null
+                        ? Image.memory(edit.coverBytes!, fit: BoxFit.cover)
+                        : const Icon(Icons.album, size: 48),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.image),
+                          label: const Text('Replace cover…'),
+                          onPressed: _pickCover,
+                        ),
+                        if (edit.coverNote != null) ...[
+                          const SizedBox(height: 6),
+                          Text(edit.coverNote!,
+                              style: theme.textTheme.bodySmall),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _title,
+                decoration: const InputDecoration(
+                    labelText: 'Title', border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _artist,
+                decoration: const InputDecoration(
+                    labelText: 'Artist', border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _album,
+                decoration: const InputDecoration(
+                    labelText: 'Album', border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _year,
+                      decoration: const InputDecoration(
+                          labelText: 'Year', border: OutlineInputBorder()),
+                      keyboardType: TextInputType.number,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: TextField(
+                      controller: _track,
+                      decoration: const InputDecoration(
+                          labelText: 'Track (e.g. 3 or 3/12)',
+                          border: OutlineInputBorder()),
+                    ),
+                  ),
+                ],
+              ),
+              if (widget.files.length > 1) ...[
+                const SizedBox(height: 10),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    icon: const Icon(Icons.copy_all),
+                    label: const Text(
+                        'Copy artist, album and year to every file'),
+                    onPressed: _copyAlbumFieldsToAll,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _saveAndClose,
+          child: const Text('Save & upload'),
+        ),
+      ],
+    );
+  }
+}
+
 class UploadPage extends StatefulWidget {
   const UploadPage({super.key});
 
@@ -1572,7 +2839,6 @@ class UploadPage extends StatefulWidget {
 
 class _UploadPageState extends State<UploadPage> {
   final List<QueueItem> _queue = [];
-  bool _dragging = false;
   bool _processing = false;
   bool _paused = false;
 
@@ -1582,10 +2848,140 @@ class _UploadPageState extends State<UploadPage> {
   bool _scanBusy = false;
   String? _scanOutcome;
 
+  // Adds arriving from outside the page (Explorer menu, second
+  // launch, whole-window drops, the watch folder) are serialised
+  // through this chain: two _addPaths runs must never interleave,
+  // or their duplicate detection races.
+  Future<void> _addsChain = Future<void>.value();
+  StreamSubscription<List<String>>? _inboundSub;
+
+  // Watch folder (1.4.0): poll timer + change events, and the sizes
+  // seen last poll (a file is handed over only once its size has
+  // been identical across two polls — never mid-copy).
+  Timer? _watchTimer;
+  StreamSubscription<FileSystemEvent>? _watchSub;
+  final Map<String, int> _watchCandidates = {};
+  bool _watchScanning = false;
+
   @override
   void initState() {
     super.initState();
     unawaited(_loadStatsWhenReady());
+    _inboundSub = inboundPaths.stream.listen((paths) {
+      if (paths.isNotEmpty) unawaited(_addPaths(paths));
+    });
+    _watchSignature =
+        '${appState.watchFolderEnabled}|${appState.watchFolderPath}';
+    appState.addListener(_onAppStateChanged);
+    _startWatchFolder();
+  }
+
+  @override
+  void dispose() {
+    appState.removeListener(_onAppStateChanged);
+    _inboundSub?.cancel();
+    _watchTimer?.cancel();
+    _watchSub?.cancel();
+    super.dispose();
+  }
+
+  String _watchSignature = '';
+
+  void _onAppStateChanged() {
+    final sig =
+        '${appState.watchFolderEnabled}|${appState.watchFolderPath}';
+    if (sig != _watchSignature) {
+      _watchSignature = sig;
+      _startWatchFolder();
+    }
+  }
+
+  // --- Watch folder --------------------------------------------------
+
+  void _startWatchFolder() {
+    _watchTimer?.cancel();
+    _watchSub?.cancel();
+    _watchCandidates.clear();
+    if (!appState.watchFolderEnabled || appState.watchFolderPath.isEmpty) {
+      return;
+    }
+    final dir = Directory(appState.watchFolderPath);
+    // The periodic rescan is the reliable spine (it also covers
+    // network drives, where change events are spotty); the watcher
+    // just makes local drops feel instant.
+    _watchTimer =
+        Timer.periodic(const Duration(seconds: 10), (_) => _scanWatchFolder());
+    try {
+      _watchSub = dir.watch(recursive: true).listen(
+            (_) => _scanWatchFolder(),
+            onError: (_) {},
+          );
+    } catch (_) {
+      // Poll-only is fine.
+    }
+    unawaited(_scanWatchFolder());
+  }
+
+  Future<void> _scanWatchFolder() async {
+    if (_watchScanning || !mounted) return;
+    if (!appState.watchFolderEnabled || appState.watchFolderPath.isEmpty) {
+      return;
+    }
+    _watchScanning = true;
+    try {
+      final dir = Directory(appState.watchFolderPath);
+      if (!await dir.exists()) return;
+      final found = <({String path, int size, String key})>[];
+      await for (final entity
+          in dir.list(recursive: true, followLinks: false)) {
+        if (entity is! File) continue;
+        final name = _basename(entity.path);
+        final ext = _extOf(name);
+        if (!(_queueable(name) ||
+            ext == 'm3u' ||
+            ext == 'm3u8' ||
+            ext == 'cue')) {
+          continue;
+        }
+        final stat = await entity.stat();
+        found.add((
+          path: entity.path,
+          size: stat.size,
+          key:
+              '${entity.path}|${stat.size}|${stat.modified.millisecondsSinceEpoch}',
+        ));
+      }
+      // The first time a folder is watched, what is already in it
+      // is baselined: marked seen, NOT uploaded. Turning the watch
+      // on must never surprise-upload an existing collection; only
+      // files that arrive afterwards upload.
+      if (!appState.watchBaselined.contains(appState.watchFolderPath)) {
+        await appState.baselineWatchFolder(
+            appState.watchFolderPath, {for (final f in found) f.key});
+        _watchCandidates.clear();
+        return;
+      }
+      final ready = <String>[];
+      final seenNow = <String>{};
+      for (final f in found) {
+        seenNow.add(f.path);
+        if (appState.watchSeen.contains(f.key)) continue;
+        if (_watchCandidates[f.path] == f.size) {
+          ready.add(f.path);
+          await appState.markWatchSeen({f.key});
+        } else {
+          _watchCandidates[f.path] = f.size;
+        }
+      }
+      _watchCandidates.removeWhere((path, _) => !seenNow.contains(path));
+      if (ready.isNotEmpty && mounted) {
+        await _addPaths(ready);
+      }
+    } catch (_) {
+      // A vanished or unreadable watch folder just skips this poll.
+    } finally {
+      _watchScanning = false;
+    }
   }
 
   Future<void> _loadStatsWhenReady() async {
@@ -1665,38 +3061,44 @@ class _UploadPageState extends State<UploadPage> {
   }
 
   void _enqueue(String name, String path, int size,
-      {String? coverPath, String? lyricsPath}) {
+      {String? coverPath,
+      String? lyricsPath,
+      String? cueText,
+      String? cueName,
+      String? playlistName,
+      String? playlistTitle,
+      String? playlistArtist,
+      int? playlistDuration,
+      Map<String, String>? tagOverrides,
+      String? coverOverridePath}) {
     _queue.add(QueueItem(name: name, path: path, size: size)
       ..coverPath = coverPath
-      ..lyricsPath = lyricsPath);
+      ..lyricsPath = lyricsPath
+      ..cueText = cueText
+      ..cueName = cueName
+      ..playlistName = playlistName
+      ..playlistTitle = playlistTitle
+      ..playlistArtist = playlistArtist
+      ..playlistDuration = playlistDuration
+      ..tagOverrides = tagOverrides
+      ..coverOverridePath = coverOverridePath);
   }
 
   Future<void> _pickFiles() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: [...kAudioExtensions, 'zip'],
+      allowedExtensions: [...kAudioExtensions, 'zip', 'm3u', 'm3u8', 'cue'],
       allowMultiple: true,
       withData: false,
     );
     if (result == null || !mounted) return;
-    setState(() {
-      for (final f in result.files) {
-        final path = f.path;
-        if (path == null) continue;
-        var size = f.size;
-        if (size <= 0) {
-          try {
-            size = File(path).lengthSync();
-          } catch (_) {
-            size = 0;
-          }
-        }
-        _enqueue(f.name, path, size);
-      }
-    });
-    // Start automatically (0.5.1): picking files IS the instruction
-    // to upload them — no second tap on "Upload N files".
-    _runQueue();
+    // Through _addPaths (1.4.0), like drops and the picker before it:
+    // sidecars, cue sheets and playlists all resolve in one place,
+    // and picking still starts the upload automatically (0.5.1).
+    await _addPaths([
+      for (final f in result.files)
+        if (f.path != null) f.path!,
+    ]);
   }
 
   String _basename(String p) {
@@ -1738,6 +3140,15 @@ class _UploadPageState extends State<UploadPage> {
     return kAudioExtensions.contains(ext) || ext == 'zip';
   }
 
+  /// Serialised entry to _addPathsInner: adds can arrive from the
+  /// picker, drops, Explorer, a second launch and the watch folder
+  /// at the same time, and two runs must never interleave.
+  Future<void> _addPaths(List<String> paths) {
+    final run = _addsChain.then((_) => _addPathsInner(paths));
+    _addsChain = run.catchError((_) {});
+    return run;
+  }
+
   /// Add files — folders since 0.5.2, ZIPs and sidecars since
   /// 0.6.0: a folder expands recursively to every audio file and
   /// ZIP inside it, in path order, so dropping an album folder
@@ -1746,11 +3157,15 @@ class _UploadPageState extends State<UploadPage> {
   /// ride along as its sidecars: a folder's cover.jpg / folder.jpg
   /// goes with each of its songs, and a .lrc sharing a song's name
   /// goes with that song. Files already queued aren't added twice.
-  Future<void> _addPaths(List<String> paths) async {
+  /// 1.4.0: a .cue beside a song marks it for server-side splitting,
+  /// and an .m3u expands to its files, tagged with their playlist.
+  Future<void> _addPathsInner(List<String> paths) async {
     final seen = _queue.map((q) => q.path).toSet();
     final songs = <String>[];
     final imagesByDir = <String, List<String>>{};
     final lyricsByKey = <String, List<String>>{};
+    final cuesByKey = <String, String>{};
+    final playlistFiles = <String>[];
     var skipped = 0;
     var emptyFolders = 0;
 
@@ -1764,6 +3179,10 @@ class _UploadPageState extends State<UploadPage> {
         imagesByDir.putIfAbsent(dir, () => []).add(filePath);
       } else if (_lyricsExtensions.contains(ext)) {
         lyricsByKey.putIfAbsent('$dir|${_stemOf(name)}', () => []).add(filePath);
+      } else if (ext == 'cue') {
+        cuesByKey['$dir|${_stemOf(name)}'] = filePath;
+      } else if (ext == 'm3u' || ext == 'm3u8') {
+        playlistFiles.add(filePath);
       }
     }
 
@@ -1781,9 +3200,13 @@ class _UploadPageState extends State<UploadPage> {
         }
         if (songs.length == before) emptyFolders++;
       } else if (type == FileSystemEntityType.file) {
+        final ext = _extOf(_basename(path));
         if (_queueable(_basename(path)) ||
-            _imageExtensions.contains(_extOf(_basename(path))) ||
-            _lyricsExtensions.contains(_extOf(_basename(path)))) {
+            _imageExtensions.contains(ext) ||
+            _lyricsExtensions.contains(ext) ||
+            ext == 'cue' ||
+            ext == 'm3u' ||
+            ext == 'm3u8') {
           harvest(path);
         } else {
           skipped++;
@@ -1803,7 +3226,7 @@ class _UploadPageState extends State<UploadPage> {
       return sorted.first;
     }
 
-    final found = <(String, String?, String?)>[];
+    final found = <_PendingAdd>[];
     for (final p in songs) {
       if (!seen.add(p)) continue;
       String? cover;
@@ -1818,15 +3241,84 @@ class _UploadPageState extends State<UploadPage> {
               orElse: () => candidates.first);
         }
       }
-      found.add((p, cover, lyr));
+      found.add(_PendingAdd(p, cover, lyr));
+    }
+
+    // Playlists (1.4.0): an .m3u expands to its local files, each
+    // tagged with the playlist so the server can rebuild it in
+    // Navidrome once the songs are in. Links inside a playlist are
+    // handed to the URL page instead — the file queue cannot fetch
+    // them itself.
+    final playlistUrls = <String>[];
+    var playlistMissing = 0;
+    for (final m3uPath in playlistFiles) {
+      final parsed = await _parseM3uFile(m3uPath);
+      if (parsed == null) continue;
+      for (final entry in parsed.entries) {
+        if (entry.isUrl) {
+          playlistUrls.add(entry.ref);
+          continue;
+        }
+        if (!seen.add(entry.ref)) continue;
+        if (!File(entry.ref).existsSync()) {
+          playlistMissing++;
+          continue;
+        }
+        found.add(_PendingAdd(entry.ref, coverFor(_parentDir(entry.ref)), null)
+          ..playlistName = parsed.name
+          ..playlistTitle = entry.title
+          ..playlistArtist = entry.artist
+          ..playlistDuration = entry.durationSeconds);
+      }
+    }
+    if (playlistUrls.isNotEmpty) inboundUrls.add(playlistUrls);
+
+    // Cue sheets (1.4.0): a .cue sharing a song's name marks that
+    // song as a single-file album the server will split. A lone cue
+    // in a folder with exactly one song pairs with it even when the
+    // names differ.
+    for (final item in found) {
+      if (_extOf(_basename(item.path)) == 'zip') continue;
+      final cuePath =
+          cuesByKey['${_parentDir(item.path)}|${_stemOf(_basename(item.path))}'];
+      if (cuePath != null) {
+        item.cueName = _basename(cuePath);
+        item.cueText = await _readCueText(cuePath);
+      }
+    }
+    if (found.length == 1 && found.single.cueText == null) {
+      for (final cuePath in cuesByKey.values) {
+        if (_parentDir(cuePath) == _parentDir(found.single.path)) {
+          found.single.cueName = _basename(cuePath);
+          found.single.cueText = await _readCueText(cuePath);
+          break;
+        }
+      }
     }
 
     if (!mounted) return;
+
+    // Tag fixer (1.4.0): with "Review tags before uploading" on,
+    // the batch waits here while the user checks and fixes tags.
+    if (found.isNotEmpty && appState.reviewTags) {
+      final proceed = await _reviewTags(found);
+      if (!proceed || !mounted) return;
+    }
+
     if (found.isNotEmpty) {
       setState(() {
-        for (final (p, cover, lyr) in found) {
-          _enqueue(_basename(p), p, _sizeOf(p),
-              coverPath: cover, lyricsPath: lyr);
+        for (final item in found) {
+          _enqueue(_basename(item.path), item.path, _sizeOf(item.path),
+              coverPath: item.coverPath,
+              lyricsPath: item.lyricsPath,
+              cueText: item.cueText,
+              cueName: item.cueName,
+              playlistName: item.playlistName,
+              playlistTitle: item.playlistTitle,
+              playlistArtist: item.playlistArtist,
+              playlistDuration: item.playlistDuration,
+              tagOverrides: item.tagOverrides,
+              coverOverridePath: item.coverOverridePath);
         }
       });
     }
@@ -1834,6 +3326,11 @@ class _UploadPageState extends State<UploadPage> {
       _snack(skipped == 1
           ? 'Skipped 1 non-audio file.'
           : 'Skipped $skipped non-audio files.');
+    } else if (playlistMissing > 0) {
+      _snack(playlistMissing == 1
+          ? '1 playlist entry points at a file that does not exist.'
+          : '$playlistMissing playlist entries point at files that '
+              'do not exist.');
     } else if (found.isEmpty && emptyFolders > 0) {
       _snack(emptyFolders == 1
           ? 'That folder contains no audio files.'
@@ -1843,8 +3340,125 @@ class _UploadPageState extends State<UploadPage> {
     if (found.isNotEmpty) _runQueue();
   }
 
-  void _addDropped(List<dynamic> files) {
-    _addPaths([for (final f in files) f.path as String]);
+  // --- Playlists and cue sheets --------------------------------------
+
+  Future<String?> _readCueText(String cuePath) async {
+    try {
+      final bytes = await File(cuePath).readAsBytes();
+      try {
+        return utf8.decode(bytes);
+      } catch (_) {
+        return latin1.decode(bytes);
+      }
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Parse an .m3u/.m3u8: #EXTINF gives artist/title per entry,
+  /// #PLAYLIST names the list, entries are links or file paths
+  /// (absolute, relative to the playlist, or file:// URLs).
+  Future<_ParsedM3u?> _parseM3uFile(String m3uPath) async {
+    String text;
+    try {
+      final bytes = await File(m3uPath).readAsBytes();
+      try {
+        text = utf8.decode(bytes);
+      } catch (_) {
+        text = latin1.decode(bytes);
+      }
+    } catch (_) {
+      return null;
+    }
+    final base = _basename(m3uPath);
+    var name = base.contains('.')
+        ? base.substring(0, base.lastIndexOf('.'))
+        : base;
+    final entries = <_M3uEntry>[];
+    String? pendingTitle;
+    String? pendingArtist;
+    int? pendingDuration;
+    for (final raw in text.split(RegExp(r'\r\n|\r|\n'))) {
+      final line = raw.trim();
+      if (line.isEmpty) continue;
+      final upper = line.toUpperCase();
+      if (line.startsWith('#')) {
+        if (upper.startsWith('#PLAYLIST:')) {
+          final v = line.substring(10).trim();
+          if (v.isNotEmpty) name = v;
+        } else if (upper.startsWith('#EXTINF:')) {
+          final comma = line.indexOf(',');
+          if (comma >= 0) {
+            // "#EXTINF:213,Artist - Title": the seconds before the
+            // comma disambiguate same-title songs server-side.
+            final secs = int.tryParse(line.substring(8, comma).trim());
+            pendingDuration = (secs != null && secs > 0) ? secs : null;
+            final info = line.substring(comma + 1).trim();
+            final dash = info.indexOf(' - ');
+            if (dash > 0) {
+              pendingArtist = info.substring(0, dash).trim();
+              pendingTitle = info.substring(dash + 3).trim();
+            } else if (info.isNotEmpty) {
+              pendingTitle = info;
+            }
+          }
+        }
+        continue;
+      }
+      entries.add(_M3uEntry(line,
+          title: pendingTitle,
+          artist: pendingArtist,
+          durationSeconds: pendingDuration));
+      pendingTitle = null;
+      pendingArtist = null;
+      pendingDuration = null;
+    }
+    final dir = _parentDir(m3uPath);
+    final resolved = <_M3uEntry>[];
+    for (final e in entries) {
+      if (e.isUrl) {
+        resolved.add(e);
+        continue;
+      }
+      var ref = e.ref;
+      if (ref.toLowerCase().startsWith('file://')) {
+        try {
+          ref = Uri.parse(ref).toFilePath();
+        } catch (_) {
+          continue;
+        }
+      }
+      ref = ref.replaceAll('\\', '/');
+      final abs = RegExp(r'^([a-zA-Z]:/|//|/)').hasMatch(ref)
+          ? ref
+          : '$dir/$ref';
+      resolved.add(_M3uEntry(abs,
+          title: e.title,
+          artist: e.artist,
+          durationSeconds: e.durationSeconds));
+    }
+    return _ParsedM3u(name, resolved);
+  }
+
+  // --- Tag fixer -------------------------------------------------------
+
+  /// Show the tag review sheet for a batch; true when the user
+  /// chose "Save & upload" (the edits land on the pending adds and
+  /// the server applies them to the library copies — the user's
+  /// own files are never rewritten), false when they cancelled
+  /// the whole batch.
+  Future<bool> _reviewTags(List<_PendingAdd> found) async {
+    final songs = [
+      for (final f in found)
+        if (_extOf(_basename(f.path)) != 'zip') f,
+    ];
+    if (songs.isEmpty) return true;
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => TagReviewDialog(files: songs),
+    );
+    return result ?? false;
   }
 
   Future<void> _pickFolder() async {
@@ -1901,11 +3515,103 @@ class _UploadPageState extends State<UploadPage> {
         }
         await _drainQueue();
       }
+      await _finishPlaylists();
     } finally {
       _processing = false;
       _paused = false;
       if (mounted) setState(() {});
       unawaited(_loadStats());
+      _reportRunFinished();
+    }
+  }
+
+  String _stemDisplay(String name) {
+    final idx = name.lastIndexOf('.');
+    return idx > 0 ? name.substring(0, idx) : name;
+  }
+
+  /// Live mirror of the run for the tray tooltip and the taskbar
+  /// progress bar (counts include earlier runs still in the list,
+  /// so the fraction stays honest as items accumulate).
+  void _updateRunProgress() {
+    final finished = _queue
+        .where((q) =>
+            q.status == QueueStatus.done || q.status == QueueStatus.error)
+        .length;
+    final total =
+        _queue.where((q) => q.status != QueueStatus.skipped).length;
+    if (total > 0) {
+      trayStatus.value = 'NaviUpload — $finished of $total files done';
+      unawaited(setTaskbarProgress(finished, total));
+    }
+  }
+
+  void _reportRunFinished() {
+    final done = _queue.where((q) => q.status == QueueStatus.done).length;
+    final failed = _queue.where((q) => q.status == QueueStatus.error).length;
+    trayStatus.value = failed > 0
+        ? 'NaviUpload — $done uploaded, $failed failed'
+        : 'NaviUpload — $done uploaded';
+    unawaited(resetTaskbarProgress());
+    if (done + failed > 0) {
+      unawaited(showUploadToast(done: done, failed: failed));
+    }
+  }
+
+  /// After a queue run: for every playlist whose files landed, ask
+  /// the server to build it in Navidrome. A playlist is attempted
+  /// once — its tags are cleared either way, so a later run of plain
+  /// files never rebuilds it.
+  Future<void> _finishPlaylists() async {
+    final byName = <String, List<QueueItem>>{};
+    for (final q in _queue) {
+      if (q.playlistName != null) {
+        byName.putIfAbsent(q.playlistName!, () => []).add(q);
+      }
+    }
+    for (final entry in byName.entries) {
+      final items = entry.value;
+      final done =
+          items.where((q) => q.status == QueueStatus.done).toList();
+      for (final q in items) {
+        q.playlistName = null;
+      }
+      if (done.isEmpty) continue;
+      final songs = <({String title, String artist, int? duration})>[
+        for (final q in done)
+          (
+            title: q.playlistTitle ??
+                q.result?.matchedTitle ??
+                _stemDisplay(q.name),
+            artist: q.playlistArtist ?? q.result?.artist ?? '',
+            duration: q.playlistDuration,
+          ),
+      ];
+      try {
+        await appState.api.scanLibrary();
+        final res = await appState.api.createPlaylist(entry.key, songs);
+        if (mounted) {
+          _snack(res.missing.isEmpty
+              ? 'Playlist "${entry.key}" created in Navidrome '
+                  '(${res.matched} songs).'
+              : 'Playlist "${entry.key}" created with ${res.matched} '
+                  'songs; ${res.missing.length} could not be found in '
+                  'Navidrome yet.');
+        }
+        appState.addHistory(HistoryItem(
+          name: entry.key,
+          source: 'Playlist',
+          at: DateTime.now(),
+          size: 0,
+          scanTriggered: true,
+          savedAs: entry.key,
+          folder: '',
+        ));
+      } catch (e) {
+        if (mounted) {
+          _snack('Playlist "${entry.key}" was not created: $e');
+        }
+      }
     }
   }
 
@@ -1922,6 +3628,22 @@ class _UploadPageState extends State<UploadPage> {
       }
     });
     unawaited(_runQueue());
+  }
+
+  /// Read a sidecar file as base64 for the chunked complete call.
+  /// Null when there is no sidecar — or when it is too big for the
+  /// server's sidecar cap, in which case the caller keeps the file
+  /// on the classic multipart path instead.
+  Future<String?> _sidecarB64(String? path) async {
+    if (path == null) return null;
+    try {
+      final f = File(path);
+      final len = await f.length();
+      if (len <= 0 || len > 4 * 1024 * 1024) return null;
+      return base64Encode(await f.readAsBytes());
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Upload every queued item, one at a time, honouring pause.
@@ -1947,20 +3669,60 @@ class _UploadPageState extends State<UploadPage> {
         });
       }
       try {
-        final res = await appState.api.uploadFile(
-          File(item.path),
-          item.name,
-          enrich: appState.enrichFiles,
-          lyrics: appState.embedLyrics,
-          sort: appState.sortFolders,
-          cover: item.coverPath == null ? null : File(item.coverPath!),
-          lyricsFile: item.lyricsPath == null ? null : File(item.lyricsPath!),
-          onProgress: (p) {
-            if (mounted) {
-              setState(() => item.progress = p);
-            }
-          },
-        );
+        // Chunked uploads (1.4.0) when the server offers them: cue
+        // albums must (the cue sheet rides the complete call), big
+        // files should (they resume instead of restarting), and a
+        // file with tag-fixer edits should (its overrides and any
+        // sidecars ride the complete call as base64). Sidecars too
+        // big for that stay on the classic multipart path.
+        final coverSource = item.coverOverridePath ?? item.coverPath;
+        String? coverB64;
+        String? lyricsB64;
+        var sidecarsFit = true;
+        if (appState.serverChunked) {
+          coverB64 = await _sidecarB64(coverSource);
+          lyricsB64 = await _sidecarB64(item.lyricsPath);
+          sidecarsFit = (coverSource == null || coverB64 != null) &&
+              (item.lyricsPath == null || lyricsB64 != null);
+        }
+        final useChunked = appState.serverChunked &&
+            sidecarsFit &&
+            (item.cueText != null
+                ? appState.serverCue
+                : item.size >= 4 * 1024 * 1024 || item.tagOverrides != null);
+        final res = useChunked
+            ? await appState.api.uploadFileChunked(
+                File(item.path),
+                item.name,
+                enrich: appState.enrichFiles,
+                lyrics: appState.embedLyrics,
+                sort: appState.sortFolders,
+                cueText: item.cueText,
+                tagOverrides: item.tagOverrides,
+                coverB64: coverB64,
+                lyricsB64: lyricsB64,
+                onProgress: (p) {
+                  if (mounted) {
+                    setState(() => item.progress = p);
+                  }
+                },
+              )
+            : await appState.api.uploadFile(
+                File(item.path),
+                item.name,
+                enrich: appState.enrichFiles,
+                lyrics: appState.embedLyrics,
+                sort: appState.sortFolders,
+                cover: coverSource == null ? null : File(coverSource),
+                lyricsFile:
+                    item.lyricsPath == null ? null : File(item.lyricsPath!),
+                tagOverrides: item.tagOverrides,
+                onProgress: (p) {
+                  if (mounted) {
+                    setState(() => item.progress = p);
+                  }
+                },
+              );
         if (mounted) {
           setState(() {
             item.status = QueueStatus.done;
@@ -1988,6 +3750,7 @@ class _UploadPageState extends State<UploadPage> {
           });
         }
       }
+      _updateRunProgress();
     }
   }
 
@@ -2000,10 +3763,15 @@ class _UploadPageState extends State<UploadPage> {
       case QueueStatus.queued:
         trailing = const Icon(Icons.schedule);
         bottom = Text(
-          item.sizeNote
-              ? 'A file with this size is already in the library — '
-                  'will upload anyway'
-              : 'Waiting',
+          item.cueText != null
+              ? 'Single-file album — the server will split it into '
+                  'tracks (${item.cueName ?? 'cue sheet'})'
+              : item.playlistName != null
+                  ? 'Part of the playlist "${item.playlistName}"'
+                  : item.sizeNote
+                      ? 'A file with this size is already in the '
+                          'library — will upload anyway'
+                      : 'Waiting',
           style: theme.textTheme.bodyMedium,
         );
       case QueueStatus.uploading:
@@ -2226,34 +3994,29 @@ class _UploadPageState extends State<UploadPage> {
         ],
         _statsCard(context),
         const SizedBox(height: 8),
-        DropTarget(
-          onDragEntered: (_) => setState(() => _dragging = true),
-          onDragExited: (_) => setState(() => _dragging = false),
-          onDragDone: (details) {
-            setState(() => _dragging = false);
-            _addDropped(details.files);
-          },
-          child: Container(
+        ValueListenableBuilder<bool>(
+          valueListenable: dragHover,
+          builder: (context, dragging, _) => Container(
             width: double.infinity,
             padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 24),
             decoration: BoxDecoration(
-              color: _dragging
+              color: dragging
                   ? scheme.primaryContainer
                   : scheme.surfaceContainerLow,
               borderRadius: BorderRadius.circular(24),
               border: Border.all(
-                color: _dragging ? scheme.primary : scheme.outlineVariant,
-                width: _dragging ? 3 : 2,
+                color: dragging ? scheme.primary : scheme.outlineVariant,
+                width: dragging ? 3 : 2,
               ),
             ),
             child: Column(
               children: [
                 Icon(Icons.cloud_upload,
                     size: 56,
-                    color: _dragging ? scheme.primary : scheme.onSurfaceVariant),
+                    color: dragging ? scheme.primary : scheme.onSurfaceVariant),
                 const SizedBox(height: 12),
                 Text(
-                  _dragging
+                  dragging
                       ? 'Let go to add them'
                       : 'Drop audio files, folders or ZIPs here',
                   style: theme.textTheme.titleLarge,
@@ -2324,6 +4087,7 @@ class _UrlPageState extends State<UrlPage> {
   final TextEditingController _urlCtrl = TextEditingController();
   final List<UrlItem> _items = [];
   bool _busy = false;
+  StreamSubscription<List<String>>? _inboundSub;
 
   @override
   void initState() {
@@ -2332,10 +4096,16 @@ class _UrlPageState extends State<UrlPage> {
     _urlCtrl.addListener(() {
       if (mounted) setState(() {});
     });
+    // Links handed over from elsewhere (1.4.0): the links inside an
+    // .m3u playlist land here, where the server-fetch flow lives.
+    _inboundSub = inboundUrls.stream.listen((links) {
+      if (links.isNotEmpty) unawaited(_submitLinks(links));
+    });
   }
 
   @override
   void dispose() {
+    _inboundSub?.cancel();
     _urlCtrl.dispose();
     super.dispose();
   }
@@ -2373,14 +4143,22 @@ class _UrlPageState extends State<UrlPage> {
       );
       return;
     }
+    setState(() => _items.clear());
+    await _submitLinks(links);
+  }
+
+  /// Run a batch of links through the server-fetch flow, appending
+  /// them to the results list (the paste box starts a fresh list;
+  /// handed-over links join the one already there).
+  Future<void> _submitLinks(List<String> links) async {
+    if (_busy || links.isEmpty) return;
+    final batch = [for (final l in links) UrlItem(l)];
     setState(() {
       _busy = true;
-      _items
-        ..clear()
-        ..addAll([for (final l in links) UrlItem(l)]);
+      _items.addAll(batch);
     });
     try {
-      for (final item in _items) {
+      for (final item in batch) {
         if (!mounted) return;
         setState(() => item.status = UrlStatus.busy);
         try {
@@ -3345,6 +5123,60 @@ class _SettingsPageState extends State<SettingsPage> {
             'System follows your Windows Light / Dark setting; Light '
             'and Dark lock the app to that look.',
             style: theme.textTheme.bodySmall
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ),
+        const _SectionHeader('Windows'),
+        _switchRow(context, 'Run in the system tray', appState.trayEnabled,
+            (v) => appState.setTrayEnabled(v)),
+        _switchRow(context, 'Start with Windows', appState.startWithWindows,
+            (v) => appState.setStartWithWindows(v)),
+        _switchRow(context, 'Explorer right-click: Send to Navidrome',
+            appState.explorerMenu, (v) => appState.setExplorerMenu(v)),
+        _switchRow(context, 'Notify when uploads finish',
+            appState.notificationsEnabled,
+            (v) => appState.setNotificationsEnabled(v)),
+        _switchRow(context, 'Review tags before uploading',
+            appState.reviewTags, (v) => appState.setReviewTags(v)),
+        _switchRow(context, 'Watch a folder for new music',
+            appState.watchFolderEnabled,
+            (v) => appState.setWatchFolderEnabled(v)),
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  appState.watchFolderPath.isEmpty
+                      ? 'No watch folder chosen yet'
+                      : appState.watchFolderPath,
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(color: scheme.onSurfaceVariant),
+                ),
+              ),
+              const SizedBox(width: 12),
+              OutlinedButton(
+                onPressed: () async {
+                  final dir = await FilePicker.platform.getDirectoryPath();
+                  if (dir != null) await appState.setWatchFolderPath(dir);
+                },
+                child: const Text('Choose folder'),
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Text(
+            'With the tray on, closing the window keeps uploads running '
+            'in the background: reopen NaviUpload from the tray icon. '
+            'The watch folder uploads every song that lands in it (it '
+            'waits until a file has finished copying first), including '
+            'whole albums in subfolders. Files already in the folder '
+            'when you first choose it are not uploaded; drop the folder '
+            'on the window if you want those too. "Review tags" opens a '
+            'tag editor for each batch before anything is sent.',
+            style: theme.textTheme.bodyMedium
                 ?.copyWith(color: scheme.onSurfaceVariant),
           ),
         ),

@@ -21,6 +21,26 @@ A small FastAPI service that runs on the same box as Navidrome
   SoundCloud...) go through yt-dlp → MP3
 - After each save it calls Navidrome's Subsonic `startScan` endpoint
   (when admin credentials are configured) so the song appears at once
+- Resumable chunked uploads (1.4.0): `POST /upload/init`,
+  `PUT /upload/chunk`, `GET /upload/status`, `POST /upload/complete`,
+  `DELETE /upload/session`. The server keeps the received chunks per
+  session, the client resumes from the server's byte count (even
+  across app restarts), and completion verifies a SHA-256 of the
+  whole file before the assembled file runs through the same save
+  pipeline as `POST /upload`. A completed session keeps its result
+  as a receipt, so a lost response never produces a duplicate
+- CUE sheet albums (1.4.0): a chunked upload can carry cue text; the
+  server splits the single file into its tracks. Lossless sources
+  are split sample-exact and re-encoded to FLAC; lossy sources are
+  stream-copied
+- `POST /playlists` (1.4.0): create a Navidrome playlist from track
+  titles/artists (the Windows app calls it after an .m3u's files have
+  uploaded). Matching is strict (title, artist, duration), and an
+  existing playlist of the same name is refilled, not duplicated
+- Tag overrides (1.4.0): both upload routes accept per-file title /
+  artist / album / year / track edits and a replacement cover,
+  applied to the saved library copy with the same tag writer
+  enrichment uses. The apps never rewrite the user's own files
 - `GET /health`, `GET /recent`; everything except `/health` needs the
   shared `X-Upload-Token`
 - Files land flat in the library root, sanitised, never overwritten
@@ -44,9 +64,10 @@ then add a Cloudflare tunnel route `upload.07051969.xyz ->
 http://localhost:8911` on the existing `zimaos-navidrome` tunnel.
 Installing the container needs sudo/docker on the box.
 
-Tests: `python3 tests/test_server.py` (12 checks),
-`tests/test_torbox.py` (8) and `tests/test_premiumize.py` (7) — the
-debrid suites run against local stub APIs; all passing.
+Tests: 16 suites under `tests/` (server endpoints, debrid routes,
+chunked uploads, playlists, tag overrides, CUE splitting, ZIP
+uploads); the debrid and playlist suites run against local stub
+APIs. All passing.
 
 ### Automatic server updates
 
@@ -81,3 +102,11 @@ rounded cards), Windows x64. Drag-and-drop or pick audio files, paste
 a URL, view history, Settings with a connection test; the token is
 kept in Windows secure storage. Built by GitHub Actions
 (windows-latest) into a zip — see `windows-app/README-windows.md`.
+
+Version 1.4.0 is a Windows-only release (the iOS app stays at
+0.6.0): resumable chunked uploads, CUE sheet album splitting, .m3u
+playlist creation in Navidrome, a pre-upload tag review whose edits
+are applied on the server, a system tray mode with optional
+start-with-Windows, an Explorer right-click "Send to Navidrome"
+verb, a watch folder, toast notifications, taskbar progress, and
+drag-and-drop anywhere on the window.

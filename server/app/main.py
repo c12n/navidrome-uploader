@@ -191,7 +191,7 @@ def record(entry: dict) -> None:
 
 
 async def finish_save(tmp_path: str, filename: str, source: str,
-                      subdir: str = "") -> dict:
+                      subdir: str = "", scan: bool = True) -> dict:
     if os.path.splitext(filename)[1].lower() not in AUDIO_EXTS:
         os.unlink(tmp_path)
         raise HTTPException(415, f"Not an audio file we can add: {filename}")
@@ -211,10 +211,13 @@ async def finish_save(tmp_path: str, filename: str, source: str,
     except OSError:
         pass
     bump_stats(size)
-    scan = await trigger_scan()
+    # Batch saves (a cue split, say) pass scan=False for all but the
+    # last file so one album costs one scan, not one per track.
+    scan_triggered = await trigger_scan() if scan else False
     entry = {
         "saved_as": os.path.basename(dest), "size": size,
-        "source": source, "scan_triggered": scan, "at": int(time.time()),
+        "source": source, "scan_triggered": scan_triggered,
+        "at": int(time.time()),
         "folder": subdir,
     }
     record(entry)
@@ -241,6 +244,13 @@ async def health() -> dict:
         "torbox_configured": bool(TORBOX_API_KEY),
         "premiumize_configured": bool(PREMIUMIZE_API_KEY),
         "autoupdate": autoupdate,
+        "features": {
+            "chunked_uploads": True,
+            "cue_split": True,
+            "playlists": bool(NAVIDROME_URL and NAVIDROME_USER
+                              and NAVIDROME_PASSWORD),
+        },
+        "chunk_size": CHUNK_SIZE,
     }
 
 
@@ -381,6 +391,7 @@ async def upload(
     sort: str = Form("false"),
     cover: UploadFile | None = File(None),
     lyrics_file: UploadFile | None = File(None),
+    tag_overrides: str = Form(""),
     x_upload_token: str | None = Header(default=None),
 ) -> dict:
     require_token(x_upload_token)
@@ -428,10 +439,22 @@ async def upload(
             if os.path.exists(tmp):
                 os.unlink(tmp)
     bundled_cover, bundled_lyrics = await _read_bundled(cover, lyrics_file)
-    return await save_processed(tmp, file.filename or "upload", "file",
-                                _flag(enrich), _flag(lyrics), _flag(sort),
-                                bundled_cover=bundled_cover,
-                                bundled_lyrics=bundled_lyrics)
+    result = await save_processed(tmp, file.filename or "upload", "file",
+                                  _flag(enrich), _flag(lyrics), _flag(sort),
+                                  bundled_cover=bundled_cover,
+                                  bundled_lyrics=bundled_lyrics)
+    # Tag overrides from the app's editor (1.4.0): a JSON object of
+    # title/artist/album/year/track, applied after enrichment so
+    # they win. The cover, when the editor changed it, already rode
+    # along as the bundled cover above.
+    if tag_overrides:
+        try:
+            parsed = json.loads(tag_overrides)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and parsed:
+            result = await _apply_tag_overrides(result, parsed, None)
+    return result
 
 
 # ------------------------------------------- metadata enrichment (0.2.0) --
@@ -983,7 +1006,8 @@ async def save_processed(local: str, fname: str, source: str,
                          want_meta: bool, want_lyrics: bool,
                          sort: bool, known: dict | None = None,
                          bundled_cover: bytes | None = None,
-                         bundled_lyrics: str | None = None) -> dict:
+                         bundled_lyrics: str | None = None,
+                         scan: bool = True) -> dict:
     """Enrich (optional) -> sort into Artist/Album (optional) -> save.
 
     Bundled cover art / lyrics (0.6.0) come with the upload itself —
@@ -1002,7 +1026,7 @@ async def save_processed(local: str, fname: str, source: str,
                 report["lyrics_embedded"] = True
     info = extract_file_info(local)
     subdir = _sort_subdir(local) if sort else ""
-    entry = await finish_save(local, fname, source, subdir)
+    entry = await finish_save(local, fname, source, subdir, scan=scan)
     entry["enriched"] = report["matched"]
     entry["metadata_source"] = report["source"]
     entry["lyrics_embedded"] = report["lyrics_embedded"]
@@ -2301,6 +2325,731 @@ async def delete_files(
         scan_triggered = await trigger_scan()
     return {"deleted": deleted, "errors": errors,
             "scan_triggered": scan_triggered}
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _decode_cover_b64(value) -> bytes | None:
+    """A cover image riding a JSON body as base64 (chunked-upload
+    completes and tag overrides). Anything malformed or oversized
+    is ignored — a cover is garnish, never a reason to fail music."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        import base64
+        data = base64.b64decode(value, validate=True)
+    except Exception:
+        return None
+    if not data or len(data) > 6 * 1024 * 1024:
+        return None
+    return data
+
+
+async def _apply_tag_overrides(entry: dict, overrides: dict | None,
+                               cover: bytes | None) -> dict:
+    """Write the app's tag overrides into a just-saved file. The
+    file is already in the library (save_processed put it there) and
+    the user's own files on their PC are never touched — the editor
+    in the app only ever describes changes, the server applies them
+    here, with the same mutagen writer enrichment uses. Overrides
+    land after enrichment so they always win; one more scan is
+    triggered so Navidrome indexes the final tags."""
+    clean: dict[str, str] = {}
+    if overrides:
+        for key in ("title", "artist", "album", "year", "track"):
+            value = overrides.get(key)
+            if value is not None and str(value).strip():
+                clean[key] = str(value).strip()
+    if not clean and not cover:
+        return entry
+    path = os.path.join(LIBRARY_DIR, entry.get("folder") or "",
+                        entry["saved_as"])
+    if os.path.exists(path) and write_tags(path, clean or None, cover, None):
+        if clean.get("artist"):
+            entry["artist"] = clean["artist"]
+        if clean.get("album"):
+            entry["album"] = clean["album"]
+        if clean.get("title"):
+            entry["matched_title"] = clean["title"]
+        entry["tag_overrides"] = True
+        if await trigger_scan():
+            entry["scan_triggered"] = True
+    return entry
+
+
+# --------------------------------------- chunked uploads + more (1.4.0) --
+# Resumable uploads for the Windows app: a big file (a FLAC album rip,
+# a single-file CUE album) no longer has to survive as one multipart
+# POST. The client opens a session, PUTs the file in 8 MiB chunks at
+# explicit offsets, and can stop, crash, sleep or lose the network at
+# any point — the server keeps what it has and reports the offset to
+# resume from. Completing a session runs the file through the exact
+# same save_processed() pipeline as POST /upload (enrichment, sorting,
+# the 0644 permissions fix, the scan trigger), so a chunked upload is
+# indistinguishable from a classic one once it lands. Sessions expire
+# after 24 hours and are swept lazily whenever a new one starts.
+
+CHUNK_SIZE = 8 * 1024 * 1024
+CHUNK_SESSION_TTL = 24 * 3600
+_CHUNK_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_chunk_locks: dict[str, asyncio.Lock] = {}
+
+
+def _chunk_root() -> str:
+    root = os.path.join(DATA_DIR, "chunks")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _chunk_lock(upload_id: str) -> asyncio.Lock:
+    lock = _chunk_locks.get(upload_id)
+    if lock is None:
+        lock = _chunk_locks[upload_id] = asyncio.Lock()
+    return lock
+
+
+def _chunk_load(upload_id: str) -> tuple[str, dict]:
+    """(session dir, meta) for a live session, else a 404."""
+    if not _CHUNK_ID_RE.match(upload_id or ""):
+        raise HTTPException(404, "Unknown upload session")
+    dirpath = os.path.join(_chunk_root(), upload_id)
+    try:
+        with open(os.path.join(dirpath, "meta.json")) as fh:
+            meta = json.load(fh)
+    except Exception:
+        raise HTTPException(404, "Unknown upload session")
+    # Sessions expire 24h after their last activity, not after
+    # creation — a paused album upload stays resumable.
+    last_active = float(meta.get("touched") or meta.get("created") or 0)
+    if time.time() - last_active > CHUNK_SESSION_TTL:
+        shutil.rmtree(dirpath, ignore_errors=True)
+        _chunk_locks.pop(upload_id, None)
+        raise HTTPException(404, "Upload session expired")
+    return dirpath, meta
+
+
+def _chunk_data_path(dirpath: str, meta: dict) -> str:
+    """The session's data file, named with the real extension:
+    parts of the save pipeline (write_tags above all) dispatch on
+    the file extension, so a neutral .bin name would silently skip
+    tag and cover embedding. The extension comes from the init-time
+    whitelist, never from raw user input."""
+    return os.path.join(dirpath, "data" + (meta.get("ext") or ".bin"))
+
+
+def _chunk_store(dirpath: str, meta: dict) -> None:
+    tmp = os.path.join(dirpath, "meta.json.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(meta, fh)
+    os.replace(tmp, os.path.join(dirpath, "meta.json"))
+
+
+def _chunk_sweep() -> None:
+    """Drop expired sessions; called when a new session starts."""
+    now = time.time()
+    try:
+        entries = os.listdir(_chunk_root())
+    except OSError:
+        return
+    for entry in entries:
+        if not _CHUNK_ID_RE.match(entry):
+            continue
+        dirpath = os.path.join(_chunk_root(), entry)
+        try:
+            with open(os.path.join(dirpath, "meta.json")) as fh:
+                created = float(json.load(fh).get("created") or 0)
+        except Exception:
+            created = 0
+        if now - created > CHUNK_SESSION_TTL:
+            shutil.rmtree(dirpath, ignore_errors=True)
+            _chunk_locks.pop(entry, None)
+
+
+@app.post("/upload/init")
+async def upload_init(request: Request,
+                      x_upload_token: str | None = Header(default=None)) -> dict:
+    """Open a resumable upload session: {filename, size} in,
+    {upload_id, chunk_size, received} out. Re-opening with the same
+    body is NOT idempotent — the client keeps its upload_id and asks
+    /upload/status to resume; a lost id simply starts over."""
+    require_token(x_upload_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Body must be JSON: {\"filename\": ..., \"size\": ...}")
+    filename = str((body or {}).get("filename") or "")
+    try:
+        size = int((body or {}).get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in AUDIO_EXTS and ext != ".zip":
+        raise HTTPException(415, f"Not an audio file we can add: {filename}")
+    if size <= 0:
+        raise HTTPException(400, "Uploaded file is empty")
+    if size > MAX_BYTES:
+        raise HTTPException(413, "File too large")
+    _chunk_sweep()
+    try:
+        active = [e for e in os.listdir(_chunk_root())
+                  if _CHUNK_ID_RE.match(e)]
+    except OSError:
+        active = []
+    if len(active) >= 8:
+        raise HTTPException(
+            429, "Too many uploads already in progress on the server")
+    upload_id = secrets.token_hex(16)
+    dirpath = os.path.join(_chunk_root(), upload_id)
+    os.makedirs(dirpath)
+    meta = {"filename": filename, "size": size, "received": 0,
+            "created": time.time(), "state": "receiving", "ext": ext}
+    # The session file is written by appends at explicit offsets and
+    # IS the assembled upload when complete runs.
+    with open(_chunk_data_path(dirpath, meta), "wb"):
+        pass
+    _chunk_store(dirpath, meta)
+    return {"upload_id": upload_id, "chunk_size": CHUNK_SIZE,
+            "received": 0, "size": size}
+
+
+@app.get("/upload/status")
+async def upload_status(upload_id: str = "",
+                        x_upload_token: str | None = Header(default=None)) -> dict:
+    """How many bytes of this session the server actually holds —
+    the only number a resuming client should trust."""
+    require_token(x_upload_token)
+    _dirpath, meta = _chunk_load(upload_id)
+    return {"upload_id": upload_id, "received": meta["received"],
+            "size": meta["size"], "filename": meta["filename"],
+            "state": meta.get("state", "receiving"),
+            "result": meta.get("result")}
+
+
+@app.put("/upload/chunk")
+async def upload_chunk(request: Request, upload_id: str = "",
+                       offset: int = -1,
+                       x_upload_token: str | None = Header(default=None)) -> dict:
+    """Append one chunk at an explicit offset. The offset must equal
+    the bytes already held: a gap or an overlap is a 409 and the
+    client re-syncs from /upload/status. A truncated chunk (network
+    drop mid-body) is rolled back the same way, so the reported
+    offset always names whole, verified chunks only."""
+    require_token(x_upload_token)
+    dirpath, meta = _chunk_load(upload_id)
+    async with _chunk_lock(upload_id):
+        if meta.get("state") == "done":
+            raise HTTPException(409, "That upload is already completed")
+        if offset != meta["received"]:
+            raise HTTPException(
+                409, f"Offset mismatch: server holds {meta['received']} bytes")
+        try:
+            declared = int(request.headers.get("content-length") or "")
+        except ValueError:
+            declared = -1
+        data_path = _chunk_data_path(dirpath, meta)
+        written = 0
+        overflow = False
+        with open(data_path, "r+b") as fh:
+            fh.seek(offset)
+            async for block in request.stream():
+                if not block:
+                    continue
+                if meta["received"] + written + len(block) > meta["size"]:
+                    overflow = True
+                    break
+                fh.write(block)
+                written += len(block)
+            if overflow or (declared >= 0 and written != declared):
+                fh.truncate(offset)
+                if overflow:
+                    raise HTTPException(413, "Chunk runs past the declared file size")
+                raise HTTPException(400, "Chunk arrived incomplete; resume from the reported offset")
+        meta["received"] = offset + written
+        meta["touched"] = time.time()
+        _chunk_store(dirpath, meta)
+        return {"received": meta["received"], "size": meta["size"]}
+
+
+@app.delete("/upload/session")
+async def upload_cancel(upload_id: str = "",
+                        x_upload_token: str | None = Header(default=None)) -> dict:
+    require_token(x_upload_token)
+    dirpath, _meta = _chunk_load(upload_id)
+    shutil.rmtree(dirpath, ignore_errors=True)
+    _chunk_locks.pop(upload_id, None)
+    return {"cancelled": True}
+
+
+async def _save_zip_upload(zip_path: str, want_meta: bool,
+                           want_lyrics: bool, want_sort: bool) -> dict:
+    """The ZIP branch of a completed chunked upload — mirrors the
+    /upload ZIP path: unpack, save every song with the art and lyrics
+    bundled inside the archive."""
+    workdir = tempfile.mkdtemp(dir=DATA_DIR if os.path.isdir(DATA_DIR) else None)
+    try:
+        tracks = _unzip_album(zip_path, workdir)
+        if not tracks:
+            raise HTTPException(
+                400, "That ZIP contains no audio files we can add")
+        saved = []
+        for t in tracks:
+            saved.append(await save_processed(
+                t["local"], t["fname"], "file",
+                want_meta, want_lyrics, want_sort,
+                bundled_cover=t["cover"], bundled_lyrics=t["lyrics"]))
+        first = saved[0]
+        first["via"] = "zip"
+        if len(saved) > 1:
+            first["also_saved"] = len(saved) - 1
+            first["files"] = [s["saved_as"] for s in saved]
+        return first
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _parse_cue(text: str) -> tuple[list, str, str, str]:
+    """Parse a single-file cue sheet into [{title, artist, start,
+    end}] plus the album-level performer, title and year (REM DATE).
+    Times are INDEX 01 positions (MM:SS:FF at 75 frames per second);
+    a track ends where the next begins, the last runs to the end of
+    the file. Multi-file cue sheets are refused: the upload carries
+    exactly one audio file."""
+    def _quoted(line: str, keyword: str) -> str | None:
+        m = re.match(keyword + r'\s+"([^"]*)"', line, re.I)
+        if m:
+            return m.group(1)
+        m = re.match(keyword + r"\s+(.+)$", line, re.I)
+        return m.group(1).strip() if m else None
+
+    files: list[str] = []
+    album_artist = ""
+    album_title = ""
+    album_year = ""
+    tracks: list[dict] = []
+    cur: dict | None = None
+    for raw in (text or "").lstrip("\ufeff").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.upper().startswith("REM "):
+            m = re.search(r"\bDATE\s+(\d{4})", line, re.I)
+            if m and not album_year:
+                album_year = m.group(1)
+            continue
+        value = _quoted(line, "FILE")
+        if value is not None and re.match(r"FILE\b", line, re.I):
+            files.append(value)
+            continue
+        if re.match(r"TRACK\s+\d+\s+AUDIO", line, re.I):
+            cur = {"title": "", "artist": "", "start": None}
+            tracks.append(cur)
+            continue
+        value = _quoted(line, "TITLE")
+        if value is not None:
+            if cur is None:
+                album_title = value
+            else:
+                cur["title"] = value
+            continue
+        value = _quoted(line, "PERFORMER")
+        if value is not None:
+            if cur is None:
+                album_artist = value
+            else:
+                cur["artist"] = value
+            continue
+        m = re.match(r"INDEX\s+01\s+(\d+):(\d+):(\d+)", line, re.I)
+        if m and cur is not None:
+            mm, ss, ff = (int(g) for g in m.groups())
+            cur["start"] = mm * 60 + ss + ff / 75.0
+    if len(set(files)) > 1:
+        raise HTTPException(
+            400, "That cue sheet references more than one audio file; "
+                 "only single-file albums are supported")
+    tracks = [t for t in tracks if t["start"] is not None]
+    if len(tracks) < 2:
+        raise HTTPException(
+            400, "That cue sheet does not list at least two tracks "
+                 "with INDEX 01 times")
+    tracks.sort(key=lambda t: t["start"])
+    # Audio before track 1's INDEX 01 is a hidden track or lead-in
+    # silence; either way it belongs to track 1, not the bin.
+    if tracks and tracks[0]["start"] > 0:
+        tracks[0]["start"] = 0.0
+    for i, track in enumerate(tracks):
+        track["end"] = (tracks[i + 1]["start"] if i + 1 < len(tracks)
+                        else None)
+    return tracks, album_artist, album_title, album_year
+
+
+_LOSSLESS_CODECS = {"flac", "alac", "ape", "wavpack", "tta"}
+
+
+def _probe_codec(path: str) -> tuple[str, int]:
+    """(codec_name, sample_rate) of the first audio stream, or
+    ("", 0) when ffprobe cannot read the file."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name,sample_rate",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=30)
+        streams = json.loads(proc.stdout or "{}").get("streams") or []
+        if streams:
+            return (str(streams[0].get("codec_name") or ""),
+                    int(streams[0].get("sample_rate") or 0))
+    except Exception:
+        pass
+    return "", 0
+
+
+def _ffmpeg_split(src: str, out: str, start: float,
+                  end: float | None, codec: str, rate: int) -> None:
+    """Cut one cue track out of the album file. The split strategy
+    follows the codec, not the container: lossless sources are
+    re-encoded to FLAC trimmed by exact sample counts (stream copy
+    would cut at packet boundaries and leave gaps or overlaps on a
+    gapless album), lossy sources are stream-copied (frame-accurate,
+    ~26 ms on MP3) because re-encoding them would cost quality.
+    Inherited tags and embedded cue sheets are stripped either way;
+    the caller writes the real per-track tags."""
+    lossless = codec in _LOSSLESS_CODECS or codec.startswith("pcm_")
+    if lossless and rate > 0:
+        start_sample = int(round(start * rate))
+        af = f"atrim=start_sample={start_sample}"
+        if end is not None:
+            af += f":end_sample={int(round(end * rate))}"
+        af += ",asetpts=PTS-STARTPTS"
+        cmd = ["ffmpeg", "-y", "-i", src, "-map", "0:a:0",
+               "-map_metadata", "-1", "-map_chapters", "-1",
+               "-af", af, "-c:a", "flac", out]
+    else:
+        cmd = ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", src]
+        if end is not None:
+            cmd += ["-t", f"{max(end - start, 0.1):.3f}"]
+        cmd += ["-map", "0:a:0", "-map_metadata", "-1", "-c", "copy", out]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.exists(out):
+        raise HTTPException(500, "ffmpeg could not split the audio file")
+
+
+async def _save_cue_upload(src: str, filename: str, cue_text: str,
+                           want_meta: bool, want_lyrics: bool,
+                           want_sort: bool,
+                           overrides: dict | None = None,
+                           cover: bytes | None = None) -> dict:
+    tracks, album_artist, album_title, album_year = _parse_cue(cue_text)
+    src_ext = os.path.splitext(filename)[1].lower()
+    codec, rate = await asyncio.to_thread(_probe_codec, src)
+    lossless = codec in _LOSSLESS_CODECS or codec.startswith("pcm_")
+    out_ext = ".flac" if lossless and rate > 0 else src_ext
+    # A cue whose times run past the end of the audio belongs to a
+    # different rip; refuse it instead of saving silence.
+    info = extract_file_info(src)
+    duration = info.get("duration_seconds") or 0
+    if duration and any(t["start"] >= duration for t in tracks):
+        raise HTTPException(
+            400, "That cue sheet's times run past the end of the "
+                 "audio file; it probably belongs to a different rip")
+    if cover is None:
+        cover = embedded_cover(src)
+    if overrides:
+        album_artist = str(overrides.get("artist") or "") or album_artist
+        album_title = str(overrides.get("album") or "") or album_title
+        album_year = str(overrides.get("year") or "") or album_year
+    workdir = tempfile.mkdtemp(dir=DATA_DIR if os.path.isdir(DATA_DIR) else None)
+    try:
+        saved = []
+        total = len(tracks)
+        for i, track in enumerate(tracks):
+            out = os.path.join(workdir, f"track{i + 1:02d}{out_ext}")
+            await asyncio.to_thread(_ffmpeg_split, src, out,
+                                    track["start"], track["end"],
+                                    codec, rate)
+            artist = track["artist"] or album_artist
+            title = track["title"] or f"Track {i + 1}"
+            meta = {"title": title, "artist": artist,
+                    "album": album_title, "track": f"{i + 1}/{total}"}
+            if album_year:
+                meta["year"] = album_year
+            write_tags(out, meta, cover, None)
+            fname = (f"{artist} - {title}{out_ext}" if artist
+                     else f"{title}{out_ext}")
+            saved.append(await save_processed(
+                out, fname, "file", want_meta, want_lyrics, want_sort,
+                scan=(i == total - 1)))
+        first = saved[0]
+        first["via"] = "cue"
+        first["scan_triggered"] = saved[-1]["scan_triggered"]
+        if len(saved) > 1:
+            first["also_saved"] = len(saved) - 1
+            first["files"] = [s["saved_as"] for s in saved]
+        return first
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@app.post("/upload/complete")
+async def upload_complete(request: Request,
+                          x_upload_token: str | None = Header(default=None)) -> dict:
+    """Finish a chunked upload: {upload_id, enrich, lyrics, sort,
+    cue?, sha256?, tag_overrides?, cover_b64?}. The assembled session
+    file runs through the same pipeline as POST /upload — or, with
+    cue text attached, is split into its tracks first. A failed
+    complete consumes the session; a successful one leaves a receipt
+    behind so a lost response can be recovered, not re-uploaded."""
+    require_token(x_upload_token)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Body must be JSON: {\"upload_id\": ...}")
+    upload_id = str((body or {}).get("upload_id") or "")
+    dirpath, meta = _chunk_load(upload_id)
+    async with _chunk_lock(upload_id):
+        # Idempotent: if the first complete's response was lost
+        # (proxy timeout, dropped connection) the client asks again
+        # and gets the stored result — never a second copy of the
+        # song with a " (2)" suffix.
+        if meta.get("state") == "done" and meta.get("result"):
+            return meta["result"]
+        if meta["received"] != meta["size"]:
+            raise HTTPException(
+                409, f"Upload incomplete: {meta['received']} of "
+                     f"{meta['size']} bytes received")
+        data_path = _chunk_data_path(dirpath, meta)
+        # Integrity: when the client sends the file's SHA-256, the
+        # assembled bytes must match it before anything is saved.
+        sha = str(body.get("sha256") or "").strip().lower()
+        if sha:
+            digest = await asyncio.to_thread(_sha256_file, data_path)
+            if digest != sha:
+                shutil.rmtree(dirpath, ignore_errors=True)
+                _chunk_locks.pop(upload_id, None)
+                raise HTTPException(
+                    422, "The uploaded bytes do not match the file's "
+                         "checksum; the session was discarded")
+        overrides = body.get("tag_overrides")
+        if not isinstance(overrides, dict):
+            overrides = None
+        cover = _decode_cover_b64(body.get("cover_b64"))
+        lyrics_text = None
+        lyrics_b64 = _decode_cover_b64(body.get("lyrics_b64"))
+        if lyrics_b64:
+            try:
+                lyrics_text = lyrics_b64.decode("utf-8")
+            except Exception:
+                lyrics_text = None
+        try:
+            cue_text = str(body.get("cue") or "")
+            ext = os.path.splitext(meta["filename"])[1].lower()
+            if cue_text.strip():
+                result = await _save_cue_upload(
+                    data_path, meta["filename"], cue_text,
+                    _flag(body.get("enrich")), _flag(body.get("lyrics")),
+                    _flag(body.get("sort")),
+                    overrides=overrides, cover=cover)
+            elif ext == ".zip":
+                result = await _save_zip_upload(
+                    data_path, _flag(body.get("enrich")),
+                    _flag(body.get("lyrics")), _flag(body.get("sort")))
+            else:
+                # Bundled sidecars ride the chunked path too (cover
+                # image, lyrics text) with the same "bundled always
+                # wins" rule as the classic multipart upload.
+                result = await save_processed(
+                    data_path, meta["filename"], "file",
+                    _flag(body.get("enrich")), _flag(body.get("lyrics")),
+                    _flag(body.get("sort")), bundled_cover=cover,
+                    bundled_lyrics=lyrics_text)
+                if overrides:
+                    result = await _apply_tag_overrides(
+                        result, overrides, None)
+        except HTTPException:
+            shutil.rmtree(dirpath, ignore_errors=True)
+            _chunk_locks.pop(upload_id, None)
+            raise
+        # Success: keep only the receipt (meta + result) for the
+        # session's remaining TTL so a lost response is recoverable
+        # from /upload/status; the bytes live in the library now.
+        try:
+            os.unlink(data_path)
+        except OSError:
+            pass
+        meta["state"] = "done"
+        meta["result"] = result
+        meta["touched"] = time.time()
+        _chunk_store(dirpath, meta)
+        return result
+
+
+# ------------------------------------------------------ playlists (1.4.0) --
+
+async def _subsonic(view: str, extra: dict) -> dict | None:
+    """One Subsonic API call; the parsed subsonic-response dict, or
+    None on any transport/API failure (callers decide how fatal)."""
+    salt = secrets.token_hex(8)
+    token = hashlib.md5(
+        f"{NAVIDROME_PASSWORD}{salt}".encode()).hexdigest()
+    params = {"u": NAVIDROME_USER, "t": token, "s": salt,
+              "v": "1.16.1", "c": "NavidromeUploader", "f": "json"}
+    params.update(extra)
+    try:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+            r = await client.get(f"{NAVIDROME_URL}/rest/{view}.view",
+                                 params=params)
+        resp = r.json().get("subsonic-response", {})
+    except Exception:
+        return None
+    return resp if resp.get("status") == "ok" else None
+
+
+async def _wait_for_scan_idle(cap_seconds: int = 30) -> None:
+    """Best-effort: if Navidrome is mid-scan, wait for it to finish
+    (bounded) so playlist resolution sees the newest uploads."""
+    deadline = time.time() + cap_seconds
+    while time.time() < deadline:
+        resp = await _subsonic("getScanStatus", {})
+        if not resp:
+            return
+        status = resp.get("scanStatus") or {}
+        if not status.get("scanning"):
+            return
+        await asyncio.sleep(2)
+
+
+async def _find_song_id(title: str, artist: str,
+                        duration: int = 0) -> str | None:
+    """Resolve a track to its Navidrome song id. Playlists are
+    forever, so the matching is stricter than /in-library's existence
+    check (title >= 0.85, artist >= 0.6), an EXTINF duration within
+    3 seconds breaks ties before fuzzy scoring, and a near-tie
+    between two different songs resolves to NO match — a wrong song
+    in a playlist is worse than a missing one."""
+    resp = await _subsonic("search3", {
+        "query": f"{artist} {title}".strip(), "songCount": 20})
+    if not resp:
+        return None
+    songs = (resp.get("searchResult3", {}).get("song") or [])
+    scored = []
+    for song in songs:
+        title_sim = _sim(title, song.get("title") or "")
+        if title_sim < 0.85:
+            continue
+        artist_sim = _sim(artist, song.get("artist") or "") if artist else 1.0
+        if artist and artist_sim < 0.6:
+            continue
+        scored.append((title_sim + artist_sim, song))
+    if not scored:
+        return None
+    if duration:
+        close = [(score, song) for score, song in scored
+                 if abs(int(song.get("duration") or 0) - duration) <= 3]
+        if close:
+            scored = close
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    best_score, best = scored[0]
+    if len(scored) > 1:
+        second_score, second = scored[1]
+        if (second.get("id") != best.get("id")
+                and second_score >= best_score - 0.05):
+            return None
+    return best.get("id")
+
+
+@app.post("/playlists")
+async def create_playlist(request: Request,
+                          x_upload_token: str | None = Header(default=None)) -> dict:
+    """Create a Navidrome playlist from [{title, artist}] — the
+    Windows app sends an .m3u's track list after uploading the files
+    themselves. Songs that cannot be resolved yet get one retry pass
+    (the library scan may still be indexing) and are reported back in
+    `missing` rather than failing the whole playlist."""
+    require_token(x_upload_token)
+    if not (NAVIDROME_URL and NAVIDROME_USER and NAVIDROME_PASSWORD):
+        raise HTTPException(
+            400, "Navidrome is not configured on this server, so "
+                 "playlists cannot be created")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Body must be JSON: {\"name\": ..., \"songs\": [...]}")
+    name = str((body or {}).get("name") or "").strip()[:120]
+    if not name:
+        raise HTTPException(400, "Give the playlist a name")
+    raw_songs = (body or {}).get("songs") or []
+    wanted = []
+    for item in raw_songs[:150]:
+        if isinstance(item, dict):
+            title = str(item.get("title") or "").strip()
+            artist = str(item.get("artist") or "").strip()
+            try:
+                duration = int(item.get("duration") or 0)
+            except (TypeError, ValueError):
+                duration = 0
+            if title:
+                wanted.append((title, artist, duration))
+    if not wanted:
+        raise HTTPException(400, "Give at least one song for the playlist")
+
+    await _wait_for_scan_idle()
+    # Resolution keeps the playlist's order: a positional list,
+    # filled in both passes, compacted at the end.
+    resolved: list[str | None] = []
+    for title, artist, duration in wanted:
+        resolved.append(await _find_song_id(title, artist, duration))
+    if any(r is None for r in resolved) and resolved.count(None) <= 50:
+        await asyncio.sleep(3)
+        for i, (title, artist, duration) in enumerate(wanted):
+            if resolved[i] is None:
+                resolved[i] = await _find_song_id(title, artist, duration)
+    missing = [{"title": t, "artist": a}
+               for (t, a, _d), r in zip(wanted, resolved) if r is None]
+    ids = [r for r in resolved if r]
+    if not ids:
+        raise HTTPException(
+            422, "None of the songs were found in Navidrome yet; give "
+                 "the library scan a moment and try again")
+
+    # Re-running a playlist replaces it: an existing list with this
+    # name is refilled in place (via its id) instead of duplicated.
+    existing_id = None
+    listing = await _subsonic("getPlaylists", {})
+    for entry in ((listing or {}).get("playlists") or {}).get("playlist") or []:
+        if (entry.get("name") or "").strip().lower() == name.lower():
+            existing_id = entry.get("id")
+            break
+
+    # Song ids ride the query string, so long playlists go in
+    # batches: create (or replace) with the first, append the rest.
+    first_batch, rest = ids[:150], ids[150:]
+    if existing_id:
+        resp = await _subsonic("createPlaylist", {
+            "playlistId": existing_id, "songId": first_batch})
+    else:
+        resp = await _subsonic("createPlaylist", {
+            "playlistName": name, "songId": first_batch})
+    playlist = (resp or {}).get("playlist") or {}
+    playlist_id = playlist.get("id") or existing_id
+    if not playlist_id:
+        raise HTTPException(502, "Navidrome refused to create the playlist")
+    while rest:
+        batch, rest = rest[:150], rest[150:]
+        await _subsonic("updatePlaylist", {
+            "playlistId": playlist_id, "songIdToAdd": batch})
+    return {"created": True, "updated": bool(existing_id), "name": name,
+            "playlist_id": playlist_id,
+            "song_count": playlist.get("songCount", len(ids)),
+            "matched": len(ids), "missing": missing,
+            "capped": len(raw_songs) > 150}
 
 
 @app.exception_handler(HTTPException)
